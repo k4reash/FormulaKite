@@ -1172,6 +1172,7 @@ def build_race_map(dfs, buoys: list, color_by: str = "Velocidad", radius_m: floa
                     "<extra></extra>",
                     "📍 %{lat:.5f}, %{lon:.5f}<extra></extra>",
                 )
+            trace.visible = "legendonly"
     else:
         fig = go.Figure()
         all_lats, all_lons = [], []
@@ -1217,6 +1218,7 @@ def build_race_map(dfs, buoys: list, color_by: str = "Velocidad", radius_m: floa
                     line=dict(width=3, color=color),
                     marker=dict(size=4, color=color),
                     name=label,
+                    visible="legendonly",
                     customdata=cd,
                     hovertemplate=(
                         f"<b>{label}</b><br>"
@@ -1453,25 +1455,20 @@ if has_gps:
         _t_max   = _all_t.max()
         _ref_date = _t_min.date()
 
-        tc1, tc2 = st.columns(2)
-        with tc1:
-            t_start = st.time_input(
-                "🕐 Hora inicio",
-                value=_t_min.to_pydatetime().time(),
-                step=60,
-                key="map_t_start",
-                help="Selecciona la hora de inicio con precisión de minutos.",
-            )
-        with tc2:
-            t_end = st.time_input(
-                "🕑 Hora fin",
-                value=_t_max.to_pydatetime().time(),
-                step=60,
-                key="map_t_end",
-                help="Selecciona la hora de fin con precisión de minutos.",
-            )
-
         import datetime as _dt
+        _t_min_time = _t_min.to_pydatetime().time()
+        _t_max_time = _t_max.to_pydatetime().time()
+
+        t_start, t_end = st.slider(
+            "⏱ Ventana temporal del track",
+            min_value=_t_min_time,
+            max_value=_t_max_time,
+            value=(_t_min_time, _t_max_time),
+            step=_dt.timedelta(seconds=1),
+            format="HH:mm:ss",
+            key="map_time_slider",
+        )
+
         _t0 = pd.Timestamp.combine(_ref_date, t_start)
         _t1 = pd.Timestamp.combine(_ref_date, t_end)
         # Si la sesión cruza medianoche, ajustar
@@ -1616,7 +1613,7 @@ if has_gps:
                  else "")
             return [c] * len(row)
 
-        for df_r in dfs:
+        for df_r in _race_dfs_src:
             r_name = df_r["Regatista"].iloc[0]
             race_legs = detect_race_legs(df_r, race_buoys, race_radius)
 
