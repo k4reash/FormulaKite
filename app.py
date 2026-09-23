@@ -3,12 +3,35 @@ Formula Kite Analytics Dashboard
 Telemetría Sailmon · Python 3 · Streamlit
 """
 
-import math
+import os
 
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+
+_COMPONENTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "components")
+_time_range_selector_component = components.declare_component(
+    "time_range_selector",
+    path=os.path.join(_COMPONENTS_DIR, "time_range_selector"),
+)
+
+
+def time_range_selector(series, duration_ms, start_clock_s, start_ms, end_ms, height=240, key=None):
+    """Selector de rango temporal (HTML/JS puro): arrastra el bloque completo para
+    mover inicio y fin a la vez, o arrastra un borde para ajustar solo ese extremo."""
+    return _time_range_selector_component(
+        series=series,
+        duration_ms=duration_ms,
+        start_clock_s=start_clock_s,
+        start_ms=start_ms,
+        end_ms=end_ms,
+        height=height,
+        ref_lines=[FOIL_FLIGHT_KTS],
+        key=key,
+        default=None,
+    )
 
 # ─── Configuración de página ─────────────────────────────────────────────────
 st.set_page_config(
@@ -37,8 +60,18 @@ st.markdown(
 
 # ─── Constantes ──────────────────────────────────────────────────────────────
 MS_TO_KNOTS = 1.94384
+LOCAL_UTC_OFFSET = pd.Timedelta(hours=2)  # Sailmon exporta en UTC; se muestra en hora local UTC+2
 RECOVERY_KTS    = 15
-FOIL_FLIGHT_KTS = 8   # por debajo de este umbral el foil no vuela (maniobra fallida)
+FOIL_FLIGHT_KTS = 8   # por debajo de este umbral el foil no vuela (maniobra fallida / Caída)
+PHASE_SMOOTH_S  = 5   # ventana (s) de la mediana móvil aplicada a SOG y |TWA|
+PHASE_MIN_S     = 5   # un tramo más corto entre dos tramos de la misma fase se absorbe (parpadeo A-B-A)
+TWA_UPWIND_MAX   = 70   # |TWA| < 70° → Ceñida
+TWA_DOWNWIND_MIN = 110  # |TWA| > 110° → Popa
+MANEUVER_WINDOW_S   = 8     # s antes y después que se comparan para confirmar el cambio de amura
+MANEUVER_SIDE_MIN   = 0.25  # |media de sin(TWA)| mínima a cada lado (≈ TWA a >15° de proa/popa)
+MANEUVER_RATE_MIN   = 4     # °/s: la maniobra dura mientras el TWA gire más rápido que esto
+MANEUVER_MAX_EXT_S  = 10    # máx. segundos que se extiende la maniobra a cada lado del cruce
+MANEUVER_PAD_S      = 1     # segundos añadidos al principio y al final
 PHASE_COLORS = {
     "Popa":       "#EF553B",
     "Ceñida":     "#00CC96",
@@ -54,27 +87,88 @@ RACER_PALETTE = [
 
 
 # ─── Lógica de negocio ───────────────────────────────────────────────────────
-def classify_phase(sog_kts: float, twa) -> str:
+def _maneuver_mask(twa: pd.Series) -> np.ndarray:
     """
-    Clasifica la fase de navegación.
-    - Caída y Transición solo dependen de SOG (TWA puede ser NaN).
-    - Popa/Ceñida/Través requieren TWA; si no hay TWA a alta velocidad -> Transición.
+    Marca las viradas/trasluchadas (cambios de amura) en una serie de TWA a 1 Hz.
+    1. Cambio de amura confirmado: la media de sin(TWA) en los MANEUVER_WINDOW_S
+       anteriores y posteriores tiene signo opuesto (las eses a popa no lo cumplen).
+    2. Desde el cruce del TWA, la maniobra se extiende a cada lado mientras el TWA
+       siga girando a más de MANEUVER_RATE_MIN °/s (máx. MANEUVER_MAX_EXT_S).
     """
-    if pd.isna(sog_kts):
-        return "Caída"
-    if sog_kts < 8:
-        return "Caída"
-    if 8 <= sog_kts < 17:
-        return "Transición"
-    # SOG >= 17 kts: usamos TWA para distinguir Popa / Través / Ceñida
-    if pd.isna(twa):
-        return "Transición"  # sin viento conocido
-    a = abs(twa)
-    if a > 110:
-        return "Popa"
-    if a < 70:
-        return "Ceñida"
-    return "Través"  # 70° ≤ |TWA| ≤ 110°
+    n = len(twa)
+    mask = np.zeros(n, dtype=bool)
+    if twa.notna().sum() < 2:
+        return mask
+
+    side = np.sin(np.radians(twa))
+    before = side.rolling(MANEUVER_WINDOW_S, min_periods=MANEUVER_WINDOW_S // 2).mean()
+    after = before.shift(-MANEUVER_WINDOW_S)
+    confirmed = (
+        (before * after < 0)
+        & (before.abs() >= MANEUVER_SIDE_MIN)
+        & (after.abs() >= MANEUVER_SIDE_MIN)
+    ).to_numpy()
+
+    t = twa.ffill().bfill().to_numpy(dtype=float)
+    unwrapped = np.degrees(np.unwrap(np.radians(t)))
+    rate = (
+        pd.Series(np.abs(np.diff(unwrapped, prepend=unwrapped[0])))
+        .rolling(3, center=True, min_periods=1).mean().to_numpy()
+    )
+    sign = np.sign(t)
+
+    i = 0
+    while i < n:
+        if not confirmed[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and confirmed[j]:
+            j += 1
+        lo, hi = max(1, i - MANEUVER_WINDOW_S), min(n, j + MANEUVER_WINDOW_S)
+        flips = np.nonzero((sign[lo:hi] != sign[lo - 1:hi - 1]) & (sign[lo:hi] != 0))[0]
+        c = lo + flips[0] if len(flips) else (i + j) // 2
+        s = c
+        while s > 0 and c - s < MANEUVER_MAX_EXT_S and rate[s - 1] > MANEUVER_RATE_MIN:
+            s -= 1
+        e = c
+        while e < n - 1 and e - c < MANEUVER_MAX_EXT_S and rate[e + 1] > MANEUVER_RATE_MIN:
+            e += 1
+        mask[max(0, s - MANEUVER_PAD_S): e + MANEUVER_PAD_S + 1] = True
+        i = j
+    return mask
+
+
+def classify_phases(sog_kts: pd.Series, twa: pd.Series) -> pd.Series:
+    """
+    Clasifica la fase de navegación de cada muestra (1 Hz).
+    - SOG y |TWA| se suavizan con una mediana móvil para eliminar ruido.
+    - En vuelo: SOG suavizada ≥ FOIL_FLIGHT_KTS.
+    - Viradas y trasluchadas (ver _maneuver_mask) → Transición.
+    - Fuera de maniobra, la fase la decide solo |TWA|; sin dato de viento → Transición.
+    - Un tramo de menos de PHASE_MIN_S entre dos tramos de la misma fase se absorbe.
+    """
+    sog = sog_kts.rolling(PHASE_SMOOTH_S, center=True, min_periods=1).median().to_numpy()
+    twa_abs = twa.abs().rolling(PHASE_SMOOTH_S, center=True, min_periods=1).median().to_numpy()
+
+    flying = sog >= FOIL_FLIGHT_KTS
+    turning = _maneuver_mask(twa)
+
+    phase = np.select(
+        [~flying, turning, np.isnan(twa_abs),
+         twa_abs < TWA_UPWIND_MAX, twa_abs > TWA_DOWNWIND_MIN],
+        ["Caída", "Transición", "Transición", "Ceñida", "Popa"],
+        default="Través",
+    )
+    phase = pd.Series(phase, index=sog_kts.index, dtype=object)
+
+    run_id = (phase != phase.shift()).cumsum()
+    runs = phase.groupby(run_id).agg(["first", "size"])
+    labels, sizes = runs["first"].tolist(), runs["size"].tolist()
+    for k in range(1, len(labels) - 1):
+        if sizes[k] < PHASE_MIN_S and labels[k - 1] == labels[k + 1]:
+            labels[k] = labels[k - 1]
+    return run_id.map(dict(zip(runs.index, labels)))
 
 
 def load_csv(file, name: str) -> pd.DataFrame:
@@ -114,23 +208,20 @@ def load_csv(file, name: str) -> pd.DataFrame:
             df[col] = pd.to_numeric(df[col], errors="coerce")
             df[f"{col}_kts"] = df[col] * MS_TO_KNOTS
 
-    # Convertir TWA y Heel a numérico (pueden tener celdas vacías)
+    # Convertir ángulos y Heel a numérico (pueden tener celdas vacías)
     for col in ("TWA", "Heel"):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Clasificar fases (TWA opcional: si falta, Caída/Transición se resuelven por SOG)
+    # Clasificar fases (TWA opcional: sin viento, en vuelo → Transición)
     if "SOG_kts" in df.columns:
-        twa_col = df["TWA"] if "TWA" in df.columns else pd.Series([float("nan")] * len(df))
-        df["Fase"] = [
-            classify_phase(sog, twa)
-            for sog, twa in zip(df["SOG_kts"], twa_col)
-        ]
+        twa_col = df["TWA"] if "TWA" in df.columns else pd.Series(np.nan, index=df.index)
+        df["Fase"] = classify_phases(df["SOG_kts"], twa_col)
 
     # Parsear tiempo (CSV en UTC → convertir a hora local UTC+2)
     if "time" in df.columns:
         df["time"] = (
-            pd.to_datetime(df["time"], errors="coerce") + pd.Timedelta(hours=2)
+            pd.to_datetime(df["time"], errors="coerce") + LOCAL_UTC_OFFSET
         )
 
     df["Regatista"] = name
@@ -363,31 +454,6 @@ def build_polar(dfs):
     return fig
 
 
-def build_histogram(dfs):
-    fig = go.Figure()
-    for idx, df in enumerate(dfs):
-        if "SOG_kts" not in df.columns:
-            continue
-        fig.add_trace(go.Histogram(
-            x=df["SOG_kts"],
-            name=df["Regatista"].iloc[0],
-            nbinsx=40,
-            marker_color=RACER_PALETTE[idx % len(RACER_PALETTE)],
-            opacity=0.7,
-            histnorm="percent",
-        ))
-    fig.update_layout(
-        barmode="overlay",
-        xaxis=dict(title="SOG (kts)", gridcolor="#2d3748", color="#a0aec0"),
-        yaxis=dict(title="% del tiempo", gridcolor="#2d3748", color="#a0aec0"),
-        **_dark_layout({
-            "height": 400,
-            "title": dict(text="Distribución de Velocidades", font=dict(color="#e2e8f0")),
-        }),
-    )
-    return fig
-
-
 def build_speed_timeline(dfs):
     fig = go.Figure()
     for idx, df in enumerate(dfs):
@@ -399,11 +465,8 @@ def build_speed_timeline(dfs):
             name=df["Regatista"].iloc[0],
             line=dict(color=RACER_PALETTE[idx % len(RACER_PALETTE)], width=1.5),
         ))
-    # Líneas de referencia de fases
     for kts, label, color in [
-        (24, "Umbral Popa (24 kts)", "#EF553B"),
-        (17, "Umbral Ceñida (17 kts)", "#00CC96"),
-        (8,  "Umbral Vuelo (8 kts)",  "#FFA15A"),
+        (FOIL_FLIGHT_KTS, f"Umbral de vuelo ({FOIL_FLIGHT_KTS} kts)", "#FFA15A"),
     ]:
         fig.add_hline(
             y=kts, line_dash="dot", line_color=color, opacity=0.5,
@@ -505,12 +568,6 @@ def build_phase_boxplot(dfs):
             boxmean="sd",          # muestra media ± desviación típica
             legendgroup=df["Regatista"].iloc[0],
         ))
-    for kts, label, color in [
-        (24, "Popa 24 kts", "#EF553B"),
-        (17, "Ceñida 17 kts", "#00CC96"),
-    ]:
-        fig.add_hline(y=kts, line_dash="dot", line_color=color, opacity=0.4,
-                      annotation_text=label, annotation_font_color=color)
     fig.update_layout(
         xaxis=dict(
             title="Fase",
@@ -982,17 +1039,7 @@ def _haversine_total(lats, lons) -> float:
     return fig
 
 
-# ─── Legs, buoy detection & Race mode ────────────────────────────────────────
-def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Distancia en metros entre dos puntos GPS."""
-    R = 6_371_000.0
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    a = (math.sin(math.radians(lat2 - lat1) / 2) ** 2
-         + math.cos(phi1) * math.cos(phi2)
-         * math.sin(math.radians(lon2 - lon1) / 2) ** 2)
-    return 2.0 * R * math.asin(math.sqrt(min(a, 1.0)))
-
-
+# ─── Legs ─────────────────────────────────────────────────────────────────────
 def _haversine_total(lats, lons) -> float:
     """Distancia total recorrida en millas náuticas."""
     lats = np.asarray(lats, dtype=float)
@@ -1006,263 +1053,6 @@ def _haversine_total(lats, lons) -> float:
     dlon = np.diff(rlon)
     a = np.sin(dlat / 2) ** 2 + np.cos(rlat[:-1]) * np.cos(rlat[1:]) * np.sin(dlon / 2) ** 2
     return float(np.sum(R_nm * 2 * np.arcsin(np.sqrt(a).clip(0, 1))))
-
-
-def detect_race_legs(df: pd.DataFrame,
-                     buoys: list,
-                     radius_m: float = 80.0) -> pd.DataFrame:
-    """
-    Segmenta el track en bordos delimitados por bordos de boya.
-    Detecta pre-salida mediante heurística: bordos antes del primer
-    par ceñida/popa de duración ≥ 30 s.
-    """
-    if not buoys or "latitude" not in df.columns or "longitude" not in df.columns:
-        return pd.DataFrame()
-
-    df = df.reset_index(drop=True)
-
-    def _nearest_buoy(lat, lon):
-        if pd.isna(lat) or pd.isna(lon):
-            return None
-        for i, b in enumerate(buoys):
-            if _haversine_m(float(lat), float(lon), b["lat"], b["lon"]) < radius_m:
-                return i
-        return None
-
-    near = [_nearest_buoy(r["latitude"], r["longitude"]) for _, r in df[["latitude", "longitude"]].iterrows()]
-
-    # Detectar entradas y salidas de zona de boya → roundings
-    roundings = []
-    in_zone, zone_start = None, None
-    for i, b_idx in enumerate(near):
-        if b_idx is not None and in_zone is None:
-            in_zone, zone_start = b_idx, i
-        elif b_idx is None and in_zone is not None:
-            roundings.append(((zone_start + i) // 2, in_zone))
-            in_zone = None
-    if in_zone is not None:
-        roundings.append(((zone_start + len(near) - 1) // 2, in_zone))
-
-    if len(roundings) < 2:
-        return pd.DataFrame()
-
-    rows = []
-    bordo_num = 1
-    for li in range(len(roundings) - 1):
-        i0, b0 = roundings[li]
-        i1, b1 = roundings[li + 1]
-        # Descartar transiciones boya→misma boya o bordos con fase dominante Transición
-        if b0 == b1:
-            continue
-        seg = df.iloc[i0:i1]
-        if len(seg) < 5:
-            continue
-
-        dur_s    = len(seg)
-        sog_mean = seg["SOG_kts"].mean()        if "SOG_kts" in seg.columns else float("nan")
-        vmg_mean = seg["VMG_kts"].mean()        if "VMG_kts" in seg.columns else float("nan")
-        fase_dom = (seg["Fase"].value_counts().idxmax()
-                    if "Fase" in seg.columns and not seg["Fase"].isna().all() else "—")
-        if fase_dom in ("Transición", "Caída"):
-            continue
-        dist_m   = (_haversine_total(seg["latitude"].ffill().values,
-                                      seg["longitude"].ffill().values) * 1852
-                    if not seg["latitude"].isna().all() else
-                    sog_mean * dur_s / 3600.0 * 1852)
-        t_inicio = "—"
-        if "time" in seg.columns:
-            t = seg["time"].dropna()
-            if not t.empty:
-                t_inicio = t.iloc[0].strftime("%H:%M:%S")
-
-        rows.append({
-            "Bordo":           bordo_num,
-            "Boya inicio":     f"B{b0 + 1}",
-            "Boya fin":        f"B{b1 + 1}",
-            "Inicio":          t_inicio,
-            "Duración":        f"{dur_s // 60}:{dur_s % 60:02d}",
-            "Fase dominante":  fase_dom,
-            "SOG media (kts)": round(sog_mean, 1) if not pd.isna(sog_mean) else None,
-            "VMG media (kts)": round(vmg_mean, 1) if not pd.isna(vmg_mean) else None,
-            "Distancia (m)":   round(dist_m, 0),
-            "_dur_s":          dur_s,
-        })
-        bordo_num += 1
-
-    if not rows:
-        return pd.DataFrame()
-
-    legs = pd.DataFrame(rows)
-
-    # Heurística pre-salida: antes del primer borde ≥ 30 s en fase Ceñida, Popa o Través
-    racing_phases = {"Ceñida", "Popa", "Través"}
-    first_race = next(
-        (i for i, r in legs.iterrows()
-         if r["_dur_s"] >= 30 and r["Fase dominante"] in racing_phases),
-        0,
-    )
-    legs["Pre-salida"] = legs.index < first_race
-    return legs.drop(columns=["_dur_s"])
-
-
-_BORDO_PALETTE = [
-    "#00E5FF", "#FF4081", "#76FF03", "#FF6D00", "#D500F9",
-    "#FFEA00", "#00E676", "#FF1744", "#2979FF", "#FF9100",
-]
-
-
-def _assign_bordo_col(df: pd.DataFrame, buoys: list, radius_m: float = 80.0) -> pd.Series:
-    """Devuelve una Series con número de bordo (1-based) por fila, o 0 si no pertenece a ninguno."""
-    bordo_col = pd.Series(0, index=range(len(df)), dtype=int)
-    if not buoys or "latitude" not in df.columns or "longitude" not in df.columns:
-        return bordo_col
-
-    df = df.reset_index(drop=True)
-
-    def _near(lat, lon):
-        if pd.isna(lat) or pd.isna(lon):
-            return None
-        for i, b in enumerate(buoys):
-            if _haversine_m(float(lat), float(lon), b["lat"], b["lon"]) < radius_m:
-                return i
-        return None
-
-    near = [_near(r["latitude"], r["longitude"])
-            for _, r in df[["latitude", "longitude"]].iterrows()]
-
-    roundings, in_zone, zone_start = [], None, None
-    for i, b_idx in enumerate(near):
-        if b_idx is not None and in_zone is None:
-            in_zone, zone_start = b_idx, i
-        elif b_idx is None and in_zone is not None:
-            roundings.append(((zone_start + i) // 2, in_zone))
-            in_zone = None
-    if in_zone is not None:
-        roundings.append(((zone_start + len(near) - 1) // 2, in_zone))
-
-    bordo_num = 1
-    for li in range(len(roundings) - 1):
-        i0, b0 = roundings[li]
-        i1, b1 = roundings[li + 1]
-        if b0 == b1:
-            continue
-        seg = df.iloc[i0:i1]
-        if len(seg) < 5:
-            continue
-        fase_dom = (seg["Fase"].value_counts().idxmax()
-                    if "Fase" in seg.columns and not seg["Fase"].isna().all() else "—")
-        if fase_dom in ("Transición", "Caída"):
-            continue
-        bordo_col.iloc[i0:i1] = bordo_num
-        bordo_num += 1
-
-    return bordo_col
-
-
-def build_race_map(dfs, buoys: list, color_by: str = "Velocidad", radius_m: float = 80.0) -> go.Figure:
-    """
-    Mapa de tracks con las boyas colocadas manualmente, marcadas en dorado.
-    color_by: "Velocidad" | "Fase" | "Bordo"
-    """
-    if color_by != "Bordo":
-        fig = build_map(dfs, color_by)
-        for trace in fig.data:
-            if hasattr(trace, "hovertemplate") and trace.hovertemplate:
-                trace.hovertemplate = trace.hovertemplate.replace(
-                    "<extra></extra>",
-                    "📍 %{lat:.5f}, %{lon:.5f}<extra></extra>",
-                )
-            trace.visible = "legendonly"
-    else:
-        fig = go.Figure()
-        all_lats, all_lons = [], []
-        for df_r in dfs:
-            r_name = df_r["Regatista"].iloc[0] if "Regatista" in df_r.columns else "?"
-            df_r = df_r.reset_index(drop=True)
-            bordo_col = _assign_bordo_col(df_r, buoys, radius_m)
-
-            # Track gris de fondo (puntos sin bordo)
-            mask0 = bordo_col == 0
-            if mask0.any():
-                fig.add_trace(go.Scattermapbox(
-                    lat=df_r.loc[mask0, "latitude"],
-                    lon=df_r.loc[mask0, "longitude"],
-                    mode="lines",
-                    line=dict(width=1, color="rgba(180,180,180,0.2)"),
-                    showlegend=False,
-                    hoverinfo="skip",
-                ))
-                all_lats += df_r.loc[mask0, "latitude"].dropna().tolist()
-                all_lons += df_r.loc[mask0, "longitude"].dropna().tolist()
-
-            # Un trace por bordo
-            n_bordos = int(bordo_col.max())
-            for bn in range(1, n_bordos + 1):
-                mask_b = bordo_col == bn
-                if not mask_b.any():
-                    continue
-                color = _BORDO_PALETTE[(bn - 1) % len(_BORDO_PALETTE)]
-                seg = df_r.loc[mask_b]
-                label = f"Bordo {bn}" + (f" – {r_name}" if len(dfs) > 1 else "")
-                sog_vals = (seg["SOG_kts"].fillna(0).apply(lambda v: f"{v:.1f}").values
-                            if "SOG_kts" in seg.columns else ["\u2014"] * len(seg))
-                fase_vals = (seg["Fase"].fillna("—").values
-                             if "Fase" in seg.columns else ["—"] * len(seg))
-                hora_vals = (seg["time"].dt.strftime("%H:%M:%S").fillna("—").values
-                             if "time" in seg.columns else ["—"] * len(seg))
-                cd = np.column_stack([sog_vals, fase_vals, hora_vals])
-                fig.add_trace(go.Scattermapbox(
-                    lat=seg["latitude"],
-                    lon=seg["longitude"],
-                    mode="lines+markers",
-                    line=dict(width=3, color=color),
-                    marker=dict(size=4, color=color),
-                    name=label,
-                    visible="legendonly",
-                    customdata=cd,
-                    hovertemplate=(
-                        f"<b>{label}</b><br>"
-                        "SOG: %{customdata[0]} kts<br>"
-                        "Fase: %{customdata[1]}<br>"
-                        "⏱ %{customdata[2]}<br>"
-                        "📍 %{lat:.5f}, %{lon:.5f}<extra></extra>"
-                    ),
-                ))
-                all_lats += seg["latitude"].dropna().tolist()
-                all_lons += seg["longitude"].dropna().tolist()
-
-        ctr_lat = float(np.mean(all_lats)) if all_lats else 0.0
-        ctr_lon = float(np.mean(all_lons)) if all_lons else 0.0
-        fig.update_layout(
-            mapbox=dict(style="carto-darkmatter",
-                        center=dict(lat=ctr_lat, lon=ctr_lon), zoom=12),
-            margin=dict(l=0, r=0, t=0, b=0),
-            height=520,
-            paper_bgcolor="#0e1117",
-            legend=dict(
-                bgcolor="rgba(0,0,0,0.5)", font=dict(color="white"),
-                x=0.01, y=0.99, xanchor="left", yanchor="top",
-            ),
-        )
-
-    for b in buoys:
-        label = b.get("name", "B?")
-        fig.add_trace(go.Scattermapbox(
-            lat=[b["lat"]],
-            lon=[b["lon"]],
-            mode="markers+text",
-            marker=dict(size=18, color="#FFD700", opacity=0.95),
-            text=[label],
-            textposition="top right",
-            textfont=dict(color="#FFD700", size=14),
-            name=label,
-            hovertemplate=(
-                f"<b>{label}</b><br>"
-                f"Lat: {b['lat']:.5f}<br>"
-                f"Lon: {b['lon']:.5f}<extra></extra>"
-            ),
-        ))
-    return fig
 
 
 def detect_legs(df: pd.DataFrame) -> pd.DataFrame:
@@ -1350,13 +1140,21 @@ with st.sidebar:
             name = st.text_input(f"Regatista {i + 1}", value=default, key=f"n{i}")
             racer_names.append(name)
 
+        if st.session_state.get("trim_confirmed_for"):
+            if st.button("🔁 Cambiar tramo seleccionado"):
+                st.session_state.pop("trim_confirmed_for", None)
+                st.session_state.pop("trim_range", None)
+                st.rerun()
+
     st.divider()
     st.markdown(
         "**Fases de Navegación:**\n\n"
-        "🔴 **Popa** · SOG ≥ 17 kts · TWA > 110°  \n"
-        "🟢 **Ceñida** · SOG ≥ 17 kts · TWA < 70°  \n"
-        "🔵 **Través** · SOG ≥ 17 kts · TWA 70–110°  \n"
-        "🟠 **Transición** · 8–17 kts"
+        f"🔴 **Popa** · en vuelo · TWA > {TWA_DOWNWIND_MIN}°  \n"
+        f"🟢 **Ceñida** · en vuelo · TWA < {TWA_UPWIND_MAX}°  \n"
+        f"🔵 **Través** · en vuelo · TWA {TWA_UPWIND_MAX}–{TWA_DOWNWIND_MIN}°  \n"
+        "🟠 **Transición** · virada/trasluchada (cambio de amura) o sin dato de viento  \n"
+        "🟣 **Caída** · fuera de vuelo\n\n"
+        f"_En vuelo: SOG ≥ {FOIL_FLIGHT_KTS} kts._"
     )
 
 
@@ -1389,15 +1187,17 @@ if not uploaded_files:
 
 
 # ─── Carga de datos ───────────────────────────────────────────────────────────
-dfs = []
+dfs_full = []
+files_full = []  # archivo original de cada df en dfs_full (para exportar el recorte)
 for f, nm in zip(uploaded_files, racer_names):
     with st.spinner(f"Procesando {f.name}…"):
         try:
-            dfs.append(load_csv(f, nm))
+            dfs_full.append(load_csv(f, nm))
+            files_full.append(f)
         except Exception as exc:
             st.error(f"❌ Error al cargar **{f.name}**: {exc}")
 
-if not dfs:
+if not dfs_full:
     st.warning("No se pudieron cargar archivos válidos.")
     st.stop()
 
@@ -1406,6 +1206,156 @@ if not dfs:
 def section(title):
     st.markdown(f'<p class="section-title">{title}</p>', unsafe_allow_html=True)
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PASO 2 · SELECCIONA EL TRAMO A ANALIZAR (modal, antes de mostrar cualquier análisis)
+# ═══════════════════════════════════════════════════════════════════════════════
+_has_gps_full = all("latitude" in d.columns and "longitude" in d.columns for d in dfs_full)
+_files_key = tuple((f.name, f.size) for f in uploaded_files)
+
+# Si han cambiado los archivos, descarta el rango recordado de la sesión anterior
+# (podría quedar fuera de los límites de tiempo del nuevo archivo). El selector
+# usa una key derivada de _files_key, así que se remonta solo con el archivo nuevo.
+if st.session_state.get("_trim_files_key") != _files_key:
+    st.session_state.pop("trim_range", None)
+    st.session_state["_trim_files_key"] = _files_key
+
+
+@st.dialog("✂️ Selecciona el tramo a analizar", width="large")
+def _trim_dialog():
+    st.caption(
+        "Recorta la sesión al tramo que quieres analizar (p. ej. una prueba completa) "
+        "y descarta el resto. **Arrastra el bloque verde** para mover todo el tramo "
+        "(misma duración), o **arrastra uno de sus bordes** para ajustar solo ese "
+        "extremo. El mapa de abajo se actualiza con cada ajuste."
+    )
+
+    _time_dfs = [d for d in dfs_full if "time" in d.columns and d["time"].notna().any()]
+    if not _time_dfs:
+        st.info("Los archivos no tienen columna de tiempo; se usará la sesión completa.")
+        if st.button("Continuar", type="primary"):
+            st.session_state["trim_range"] = None
+            st.session_state["trim_confirmed_for"] = _files_key
+            st.rerun()
+        return
+
+    _all_t = pd.concat([d["time"].dropna() for d in _time_dfs])
+    _t_min, _t_max = _all_t.min(), _all_t.max()
+    _duration_ms = (_t_max - _t_min).total_seconds() * 1000
+    _start_clock_s = _t_min.hour * 3600 + _t_min.minute * 60 + _t_min.second
+
+    _prev_range = st.session_state.get("trim_range")
+    if _prev_range:
+        _default_start_ms = (_prev_range[0] - _t_min).total_seconds() * 1000
+        _default_end_ms = (_prev_range[1] - _t_min).total_seconds() * 1000
+    else:
+        _default_start_ms, _default_end_ms = 0, _duration_ms
+
+    _series = []
+    for i, d in enumerate(dfs_full):
+        if "time" not in d.columns or "SOG_kts" not in d.columns:
+            continue
+        dd = d[["time", "SOG_kts"]].dropna()
+        if len(dd) > 700:
+            dd = dd.iloc[:: max(1, len(dd) // 700)]
+        _series.append({
+            "name": str(d["Regatista"].iloc[0]) if "Regatista" in d.columns else f"Regatista {i + 1}",
+            "color": RACER_PALETTE[i % len(RACER_PALETTE)],
+            "points": [
+                [(t - _t_min).total_seconds() * 1000, float(v)]
+                for t, v in zip(dd["time"], dd["SOG_kts"])
+            ],
+        })
+
+    _result = time_range_selector(
+        series=_series,
+        duration_ms=_duration_ms,
+        start_clock_s=_start_clock_s,
+        start_ms=_default_start_ms,
+        end_ms=_default_end_ms,
+        key=f"trim_range_selector_{hash(_files_key)}",
+    )
+
+    if _result:
+        _t0 = _t_min + pd.Timedelta(milliseconds=_result["start_ms"])
+        _t1 = _t_min + pd.Timedelta(milliseconds=_result["end_ms"])
+    else:
+        _t0 = _t_min + pd.Timedelta(milliseconds=_default_start_ms)
+        _t1 = _t_min + pd.Timedelta(milliseconds=_default_end_ms)
+
+    _preview = [d[d["time"].between(_t0, _t1)].copy() for d in dfs_full if "time" in d.columns]
+    _preview = [d for d in _preview if not d.empty]
+
+    if not _preview:
+        st.warning("Sin datos en el tramo seleccionado.")
+    elif _has_gps_full:
+        st.plotly_chart(
+            build_map(_preview, "Velocidad"),
+            use_container_width=True,
+            config={"scrollZoom": True},
+            key="trim_preview_map",
+        )
+    else:
+        st.info("Los archivos no tienen GPS; no se puede previsualizar en el mapa.")
+        st.plotly_chart(
+            build_speed_timeline(_preview),
+            use_container_width=True,
+        )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("✅ Confirmar tramo y analizar", type="primary", disabled=not _preview):
+            st.session_state["trim_range"] = (_t0, _t1)
+            st.session_state["trim_confirmed_for"] = _files_key
+            st.rerun()
+    with c2:
+        if st.button("Usar sesión completa"):
+            st.session_state["trim_range"] = None
+            st.session_state["trim_confirmed_for"] = _files_key
+            st.rerun()
+
+
+if st.session_state.get("trim_confirmed_for") != _files_key:
+    _trim_dialog()
+    st.stop()
+
+_trim_range = st.session_state.get("trim_range")
+if _trim_range:
+    _t0, _t1 = _trim_range
+    dfs = [d[d["time"].between(_t0, _t1)].copy() for d in dfs_full if "time" in d.columns]
+    dfs = [d for d in dfs if not d.empty]
+else:
+    dfs = dfs_full
+
+if not dfs:
+    st.warning("No hay datos en el tramo seleccionado.")
+    st.stop()
+
+def _raw_trimmed_csv(file, trim_range) -> bytes:
+    """Filas del CSV original de Sailmon (mismas columnas, hora en UTC) dentro del tramo,
+    para que el recorte se pueda volver a subir como un export normal."""
+    file.seek(0)
+    raw = pd.read_csv(file)
+    if trim_range:
+        time_col = next(c for c in raw.columns if c.strip().replace('"', "") == "time")
+        local_t = pd.to_datetime(raw[time_col], errors="coerce") + LOCAL_UTC_OFFSET
+        raw = raw[local_t.between(*trim_range)]
+    return raw.to_csv(index=False).encode("utf-8")
+
+
+with st.expander("⬇️ Descargar CSV recortado por regatista"):
+    st.caption("Mismo formato que el export de Sailmon: puedes volver a subirlo a la app tal cual.")
+    for f_dl, df_dl in zip(files_full, dfs_full):
+        _dl_name = df_dl["Regatista"].iloc[0]
+        st.download_button(
+            f"Descargar {_dl_name}_recortado.csv",
+            data=_raw_trimmed_csv(f_dl, _trim_range),
+            file_name=f"{_dl_name}_recortado.csv",
+            mime="text/csv",
+            key=f"dl_{_dl_name}",
+        )
+
+st.divider()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECCIÓN 1 · KPIs
@@ -1447,211 +1397,16 @@ if has_gps:
     with map_c1:
         color_by = st.radio("Colorear por:", ["Velocidad", "Fase"], horizontal=True)
 
-    # ── Filtro de tiempo exacto ───────────────────────────────────────────────
-    _time_dfs = [d for d in dfs if "time" in d.columns and d["time"].notna().any()]
-    if _time_dfs:
-        _all_t   = pd.concat([d["time"].dropna() for d in _time_dfs])
-        _t_min   = _all_t.min()
-        _t_max   = _all_t.max()
-        _ref_date = _t_min.date()
-
-        import datetime as _dt
-        _t_min_time = _t_min.to_pydatetime().time()
-        _t_max_time = _t_max.to_pydatetime().time()
-
-        t_start, t_end = st.slider(
-            "⏱ Ventana temporal del track",
-            min_value=_t_min_time,
-            max_value=_t_max_time,
-            value=(_t_min_time, _t_max_time),
-            step=_dt.timedelta(seconds=1),
-            format="HH:mm:ss",
-            key="map_time_slider",
-        )
-
-        _t0 = pd.Timestamp.combine(_ref_date, t_start)
-        _t1 = pd.Timestamp.combine(_ref_date, t_end)
-        # Si la sesión cruza medianoche, ajustar
-        if _t1 < _t0:
-            _t1 += pd.Timedelta(days=1)
-
-        dfs_map = [d[d["time"].between(_t0, _t1)].copy() for d in dfs
-                   if "time" in d.columns]
-        dfs_map = [d for d in dfs_map if not d.empty]
-    else:
-        dfs_map = dfs
-
-    if dfs_map:
-        st.plotly_chart(
-            build_map(dfs_map, color_by),
-            use_container_width=True,
-            config={"scrollZoom": True},
-        )
-    else:
-        st.info("Sin datos GPS en la ventana seleccionada.")
+    st.plotly_chart(
+        build_map(dfs, color_by),
+        use_container_width=True,
+        config={"scrollZoom": True},
+    )
 
 else:
     st.info("ℹ️ Los archivos no contienen columnas de GPS (latitude/longitude). El mapa no está disponible.")
 
 st.divider()
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECCIÓN 2B · MODO REGATA
-# ═══════════════════════════════════════════════════════════════════════════════
-if has_gps:
-    section("🏁 Modo Regata")
-
-    race_mode = st.radio(
-        "Modo de sesión:",
-        ["Entrenamiento", "Regata"],
-        horizontal=True,
-        key="race_mode_toggle",
-        help="En modo Regata puedes colocar las boyas manualmente y analizar los bordos.",
-    )
-
-    if race_mode == "Regata":
-        st.caption(
-            "Coloca las boyas del recorrido usando las coordenadas GPS del mapa de tracks. "
-            "💡 Pasa el ratón por el mapa superior — Plotly muestra la latitud y longitud "
-            "en la barra inferior derecha del mapa."
-        )
-
-        # ── Configuración de boyas ───────────────────────────────────────────
-        _all_lat = pd.concat([d["latitude"].dropna() for d in dfs if "latitude" in d.columns])
-        _all_lon = pd.concat([d["longitude"].dropna() for d in dfs if "longitude" in d.columns])
-        _center_lat = float(_all_lat.mean())
-        _center_lon = float(_all_lon.mean())
-
-        brc1, brc2 = st.columns([1, 3])
-        with brc1:
-            n_buoys = st.number_input(
-                "Número de boyas", min_value=1, max_value=8, value=3, step=1,
-                help="Boyas del recorrido (top mark, gate, línea de salida…).",
-            )
-            race_radius = st.slider(
-                "Radio de rounding (m)", 20, 200, 60, step=5,
-                help="Distancia a la que se considera que el barco ha pasado la boya.",
-            )
-
-        with brc2:
-            st.markdown("**Posición de cada boya** — pega las coordenadas copiadas del mapa (`lat, lon`):")
-            race_buoys = []
-            buoy_cols = st.columns(int(n_buoys))
-            _default_coords = f"{_center_lat:.5f}, {_center_lon:.5f}"
-            for bi, bcol in enumerate(buoy_cols):
-                with bcol:
-                    st.markdown(f"🟡 **B{bi + 1}**")
-                    raw = st.text_input(
-                        "lat, lon",
-                        value=_default_coords,
-                        key=f"buoy_coords_{bi}",
-                        placeholder="37.75223, -0.82061",
-                    )
-                    try:
-                        parts = [p.strip() for p in raw.split(",")]
-                        b_lat, b_lon = float(parts[0]), float(parts[1])
-                    except Exception:
-                        b_lat, b_lon = _center_lat, _center_lon
-                        st.caption("⚠️ Formato inválido")
-                    race_buoys.append({"lat": b_lat, "lon": b_lon, "name": f"B{bi + 1}"})
-
-        # ── Mapa de regata ───────────────────────────────────────────────────
-        race_color_by = st.radio(
-            "Colorear por:", ["Velocidad", "Fase", "Bordo"],
-            horizontal=True, key="race_color_by",
-        )
-        _race_dfs_src = dfs_map if ("dfs_map" in dir() and dfs_map) else dfs
-        _race_map_event = st.plotly_chart(
-            build_race_map(_race_dfs_src, race_buoys, race_color_by, race_radius),
-            use_container_width=True,
-            config={"scrollZoom": True},
-            on_select="rerun",
-            selection_mode="points",
-            key="race_map_select",
-        )
-        # Mostrar coordenadas del punto pinchado con botón de copia
-        _sel_pts = (
-            _race_map_event.selection.points
-            if _race_map_event and hasattr(_race_map_event, "selection")
-            else []
-        )
-        if _sel_pts:
-            _pt = _sel_pts[0]
-            _pt_lat = _pt.get("lat")
-            _pt_lon = _pt.get("lon")
-            if _pt_lat is not None and _pt_lon is not None:
-                st.info(
-                    f"📍 Punto seleccionado — copia las coordenadas con el botón ▷"
-                )
-                st.code(f"{_pt_lat:.5f}, {_pt_lon:.5f}", language=None)
-
-        st.divider()
-
-        # ── Tabla de bordos ──────────────────────────────────────────────────
-        section("📋 Tabla de Bordos")
-        st.caption(
-            "Cada fila es un bordo entre dos boyas."
-        )
-
-        col_cfg_race = {
-            "Bordo":           st.column_config.NumberColumn("Bordo", format="%d"),
-            "Boya inicio":     st.column_config.TextColumn("Boya inicio"),
-            "Boya fin":        st.column_config.TextColumn("Boya fin"),
-            "Inicio":          st.column_config.TextColumn("Inicio"),
-            "Duración":        st.column_config.TextColumn("Duración", help="MM:SS"),
-            "Fase dominante":  st.column_config.TextColumn("Fase dominante"),
-            "SOG media (kts)": st.column_config.NumberColumn("SOG media (kts)", format="%.1f kts"),
-            "VMG media (kts)": st.column_config.NumberColumn("VMG media (kts)", format="%.1f kts"),
-            "Distancia (m)":   st.column_config.NumberColumn("Distancia (m)", format="%.0f m"),
-        }
-
-        def _color_race_leg(row):
-            f = row["Fase dominante"]
-            c = ("background-color: rgba(0,204,150,0.12)"  if f == "Ceñida"
-                 else "background-color: rgba(239,85,59,0.12)"   if f == "Popa"
-                 else "background-color: rgba(25,211,243,0.12)"  if f == "Través"
-                 else "")
-            return [c] * len(row)
-
-        for df_r in _race_dfs_src:
-            r_name = df_r["Regatista"].iloc[0]
-            race_legs = detect_race_legs(df_r, race_buoys, race_radius)
-
-            legs_race = race_legs[~race_legs["Pre-salida"]].drop(columns=["Pre-salida"]) if not race_legs.empty else pd.DataFrame()
-
-            summary = (f"{len(legs_race)} bordos"
-                       if not race_legs.empty else "sin bordos detectados")
-
-            with st.expander(f"**{r_name}** — {summary}", expanded=True):
-                if race_legs.empty:
-                    st.info(
-                        "No se detectaron bordos. Verifica que las coordenadas de las boyas "
-                        "sean correctas y ajusta el radio de rounding."
-                    )
-                    continue
-
-                mk1, mk2, mk3 = st.columns(3)
-                mk1.metric("Bordos regata", len(legs_race))
-                mk2.metric(
-                    "SOG media regata",
-                    f"{legs_race['SOG media (kts)'].mean():.1f} kts"
-                    if not legs_race.empty and legs_race["SOG media (kts)"].notna().any() else "—",
-                )
-                mk3.metric(
-                    "Dist. total regata",
-                    f"{legs_race['Distancia (m)'].sum():.0f} m"
-                    if not legs_race.empty else "—",
-                )
-
-                if not legs_race.empty:
-                    st.dataframe(
-                        legs_race.style.apply(_color_race_leg, axis=1),
-                        column_config=col_cfg_race,
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-
-    st.divider()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECCIÓN 3 · VELOCIDAD EN EL TIEMPO
@@ -1661,13 +1416,16 @@ st.plotly_chart(build_speed_timeline(dfs), use_container_width=True)
 st.divider()
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECCIÓN 4 · POLAR + HISTOGRAMA
+# SECCIÓN 4 · POLARES (SOG + VMG)
 # ═══════════════════════════════════════════════════════════════════════════════
-cl, cr = st.columns(2)
+has_vmg  = any("VMG_kts" in d.columns for d in dfs)
+has_fase = any("Fase" in d.columns for d in dfs)
+has_twa  = any("TWA" in d.columns for d in dfs)
 
-with cl:
+pl, pr = st.columns(2)
+with pl:
     section("🧭 Polar Comparativa")
-    if any("TWA" in d.columns for d in dfs):
+    if has_twa:
         st.caption(
             "Velocidad media (SOG) por ángulo al viento, en fases de vuelo (Ceñida, Través y Popa). "
             "El eje angular va de 0° (viento de frente) a 180° (viento de popa exacta). "
@@ -1677,50 +1435,37 @@ with cl:
         st.plotly_chart(build_polar(dfs), use_container_width=True)
     else:
         st.info("Sin datos de TWA para construir la polar.")
-
-with cr:
-    section("📊 Distribución de Velocidades")
-    st.plotly_chart(build_histogram(dfs), use_container_width=True)
+with pr:
+    section("🎯 Polar de VMG")
+    if has_vmg and has_twa:
+        st.caption(
+            "Muestra la velocidad real hacia el destino (VMG) según el ángulo al viento (TWA), "
+            "solo en fases de vuelo (Ceñida, Través y Popa). "
+            "El eje angular va de 0° (viento de frente) a 180° (viento de popa). "
+            "Los dos picos de la curva indican los **ángulos óptimos** de ceñida y popa. "
+            "Un pico más alto y exterior = más VMG a ese ángulo. "
+            "En comparativas, la curva más exterior gana en avance real."
+        )
+        st.plotly_chart(build_vmg_polar(dfs), use_container_width=True)
+    else:
+        st.info("Sin datos de VMG o TWA.")
 
 st.divider()
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECCIÓN 5 · VMG POLAR + BOX PLOT
+# SECCIÓN 5 · CONSISTENCIA POR FASE + ESCORA
 # ═══════════════════════════════════════════════════════════════════════════════
-has_vmg  = any("VMG_kts" in d.columns for d in dfs)
-has_fase = any("Fase" in d.columns for d in dfs)
-has_twa  = any("TWA" in d.columns for d in dfs)
-
-if has_vmg or has_fase:
-    vl, vr = st.columns(2)
-    with vl:
-        section("🎯 Polar de VMG")
-        if has_vmg and has_twa:
-            st.caption(
-                "Muestra la velocidad real hacia el destino (VMG) según el ángulo al viento (TWA), "
-                "solo en fases de vuelo (Ceñida, Través y Popa). "
-                "El eje angular va de 0° (viento de frente) a 180° (viento de popa). "
-                "Los dos picos de la curva indican los **ángulos óptimos** de ceñida y popa. "
-                "Un pico más alto y exterior = más VMG a ese ángulo. "
-                "En comparativas, la curva más exterior gana en avance real."
-            )
-            st.plotly_chart(build_vmg_polar(dfs), use_container_width=True)
-        else:
-            st.info("Sin datos de VMG o TWA.")
-    with vr:
-        section("📦 Consistencia por Fase")
-        if has_fase:
-            st.caption(
-                "Distribución de SOG en Popa, Través y Ceñida. "
-                "La caja muestra el rango del 50% central de los datos (P25–P75); "
-                "la línea central es la mediana y el rombo la media. "
-                "Una caja estrecha y alta indica velocidad constante a ritmo elevado (consistente). "
-                "Una caja ancha y baja indica velocidad irregular (inconsistente). "
-                "En comparativas, el regatista con la caja más alta y estrecha domina esa fase."
-            )
-            st.plotly_chart(build_phase_boxplot(dfs), use_container_width=True)
-        else:
-            st.info("Sin datos de fases.")
+if has_fase:
+    section("📦 Consistencia por Fase")
+    st.caption(
+        "Distribución de SOG en Popa, Través y Ceñida. "
+        "La caja muestra el rango del 50% central de los datos (P25–P75); "
+        "la línea central es la mediana y el rombo la media. "
+        "Una caja estrecha y alta indica velocidad constante a ritmo elevado (consistente). "
+        "Una caja ancha y baja indica velocidad irregular (inconsistente). "
+        "En comparativas, el regatista con la caja más alta y estrecha domina esa fase."
+    )
+    st.plotly_chart(build_phase_boxplot(dfs), use_container_width=True)
 
 # ─── Heel Analysis ────────────────────────────────────────────────────────────
 has_heel = any("Heel" in d.columns for d in dfs)

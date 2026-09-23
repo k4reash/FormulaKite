@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<style>
+  html, body {
+    margin: 0; padding: 0; background: transparent;
+    font-family: "Source Sans Pro", -apple-system, BlinkMacSystemFont, sans-serif;
+    color: #fafafa;
+    user-select: none;
+    -webkit-user-select: none;
+    overflow: hidden;
+  }
+  #wrap { width: 100%; }
+  #info {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    font-size: 13px;
+    padding: 2px 4px 6px 4px;
+    color: #d0d0d0;
+  }
+  #info b { color: #00CC96; font-size: 14px; }
+  svg { width: 100%; display: block; touch-action: none; }
+  .grid-line { stroke: rgba(255,255,255,0.08); stroke-width: 1; }
+  .ref-line { stroke: rgba(255,255,255,0.18); stroke-width: 1; stroke-dasharray: 4 3; }
+  .ref-label { fill: rgba(255,255,255,0.35); font-size: 10px; }
+  .series-line { fill: none; stroke-width: 1.6; opacity: 0.95; }
+  .axis-label { fill: rgba(255,255,255,0.55); font-size: 10px; }
+  .band {
+    fill: rgba(0, 204, 150, 0.16);
+    stroke: #00CC96;
+    stroke-width: 1.5;
+    cursor: grab;
+  }
+  .band:active { cursor: grabbing; }
+  .handle {
+    fill: #00CC96;
+    opacity: 0.9;
+    cursor: ew-resize;
+  }
+  .handle:hover { opacity: 1; }
+  .handle-grip {
+    stroke: #08110e;
+    stroke-width: 1;
+  }
+  .legend { display: flex; gap: 12px; font-size: 11px; padding: 0 4px 4px 4px; flex-wrap: wrap; }
+  .legend span { display: inline-flex; align-items: center; gap: 4px; }
+  .legend i { width: 10px; height: 3px; display: inline-block; border-radius: 2px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="info">
+    <div>Tramo: <b id="lbl-range">--:--:-- → --:--:--</b></div>
+    <div id="lbl-dur">Duración: 00:00:00</div>
+  </div>
+  <div class="legend" id="legend"></div>
+  <svg id="chart" viewBox="0 0 1000 240" preserveAspectRatio="none"></svg>
+</div>
+
+<script>
+const NS = "http://www.w3.org/2000/svg";
+const VB_W = 1000, PAD_L = 6, PAD_R = 6, PAD_TOP = 10, PAD_BOTTOM = 22;
+const MIN_GAP_MS = 3000;
+
+let args = null;
+let vbH = 240;
+let plotW = VB_W - PAD_L - PAD_R;
+let plotTop = PAD_TOP, plotH = 0;
+let startMs = 0, endMs = 0;
+let drag = null; // {mode:'move'|'left'|'right', startClientX, origStart, origEnd}
+
+const svg = document.getElementById("chart");
+const lblRange = document.getElementById("lbl-range");
+const lblDur = document.getElementById("lbl-dur");
+const legendEl = document.getElementById("legend");
+
+function fmtHMS(totalSeconds) {
+  totalSeconds = ((totalSeconds % 86400) + 86400) % 86400;
+  const h = Math.floor(totalSeconds / 3600);
+  const m = Math.floor((totalSeconds % 3600) / 60);
+  const s = Math.floor(totalSeconds % 60);
+  return [h, m, s].map(v => String(v).padStart(2, "0")).join(":");
+}
+
+function fmtDur(ms) {
+  return fmtHMS(Math.round(ms / 1000));
+}
+
+function xForMs(ms) {
+  const t = args.duration_ms > 0 ? ms / args.duration_ms : 0;
+  return PAD_L + t * plotW;
+}
+function msForX(x) {
+  const t = (x - PAD_L) / plotW;
+  return Math.min(Math.max(t, 0), 1) * args.duration_ms;
+}
+function svgPoint(clientX) {
+  const rect = svg.getBoundingClientRect();
+  const x = (clientX - rect.left) / rect.width * VB_W;
+  return x;
+}
+
+function el(tag, attrs) {
+  const e = document.createElementNS(NS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  return e;
+}
+
+function render() {
+  svg.innerHTML = "";
+  svg.setAttribute("viewBox", `0 0 ${VB_W} ${vbH}`);
+  plotTop = PAD_TOP;
+  plotH = vbH - PAD_TOP - PAD_BOTTOM;
+
+  // background
+  svg.appendChild(el("rect", { x: 0, y: 0, width: VB_W, height: vbH, fill: "rgba(255,255,255,0.02)" }));
+
+  // horizontal grid (4 lines)
+  for (let i = 0; i <= 4; i++) {
+    const y = plotTop + (plotH * i) / 4;
+    svg.appendChild(el("line", { x1: PAD_L, x2: VB_W - PAD_R, y1: y, y2: y, class: "grid-line" }));
+  }
+
+  // speed range across all series
+  let yMin = 0, yMax = 1;
+  let hasData = false;
+  (args.series || []).forEach(s => {
+    s.points.forEach(p => {
+      if (!hasData) { yMin = p[1]; yMax = p[1]; hasData = true; }
+      if (p[1] < yMin) yMin = p[1];
+      if (p[1] > yMax) yMax = p[1];
+    });
+  });
+  if (!hasData) { yMin = 0; yMax = 30; }
+  const pad = Math.max((yMax - yMin) * 0.08, 1);
+  yMin -= pad; yMax += pad;
+
+  function yForSpeed(v) {
+    const t = (v - yMin) / (yMax - yMin || 1);
+    return plotTop + plotH - t * plotH;
+  }
+
+  // reference threshold lines (kts)
+  (args.ref_lines || []).forEach(v => {
+    if (v >= yMin && v <= yMax) {
+      const y = yForSpeed(v);
+      svg.appendChild(el("line", { x1: PAD_L, x2: VB_W - PAD_R, y1: y, y2: y, class: "ref-line" }));
+      const t = el("text", { x: VB_W - PAD_R - 2, y: y - 3, class: "ref-label", "text-anchor": "end" });
+      t.textContent = v + " kt";
+      svg.appendChild(t);
+    }
+  });
+
+  // series lines
+  legendEl.innerHTML = "";
+  (args.series || []).forEach(s => {
+    if (!s.points.length) return;
+    const d = s.points.map((p, i) => `${i === 0 ? "M" : "L"}${xForMs(p[0]).toFixed(1)},${yForSpeed(p[1]).toFixed(1)}`).join(" ");
+    svg.appendChild(el("path", { d, class: "series-line", stroke: s.color }));
+    const item = document.createElement("span");
+    item.innerHTML = `<i style="background:${s.color}"></i>${s.name}`;
+    legendEl.appendChild(item);
+  });
+
+  // time axis labels (start / end of full session)
+  const startLbl = el("text", { x: PAD_L, y: vbH - 6, class: "axis-label" });
+  startLbl.textContent = fmtHMS(args.start_clock_s);
+  svg.appendChild(startLbl);
+  const endLbl = el("text", { x: VB_W - PAD_R, y: vbH - 6, class: "axis-label", "text-anchor": "end" });
+  endLbl.textContent = fmtHMS(args.start_clock_s + args.duration_ms / 1000);
+  svg.appendChild(endLbl);
+
+  drawBand();
+}
+
+let bandRect, handleL, handleR;
+
+function drawBand() {
+  const existing = svg.querySelectorAll(".band, .handle, .handle-grip");
+  existing.forEach(n => n.remove());
+
+  const x0 = xForMs(startMs), x1 = xForMs(endMs);
+  bandRect = el("rect", {
+    x: x0, y: plotTop, width: Math.max(x1 - x0, 0.1), height: plotH, class: "band",
+  });
+  svg.appendChild(bandRect);
+
+  const hw = 9;
+  handleL = el("rect", { x: x0 - hw / 2, y: plotTop, width: hw, height: plotH, class: "handle" });
+  handleR = el("rect", { x: x1 - hw / 2, y: plotTop, width: hw, height: plotH, class: "handle" });
+  svg.appendChild(handleL);
+  svg.appendChild(handleR);
+
+  [handleL, handleR].forEach((h, idx) => {
+    const cx = idx === 0 ? x0 : x1;
+    for (const dx of [-1.5, 1.5]) {
+      svg.appendChild(el("line", {
+        x1: cx + dx, x2: cx + dx, y1: plotTop + plotH * 0.3, y2: plotTop + plotH * 0.7, class: "handle-grip",
+      }));
+    }
+  });
+
+  bandRect.addEventListener("pointerdown", e => startDrag(e, "move"));
+  handleL.addEventListener("pointerdown", e => startDrag(e, "left"));
+  handleR.addEventListener("pointerdown", e => startDrag(e, "right"));
+
+  updateLabels();
+}
+
+function updateLabels() {
+  lblRange.textContent = `${fmtHMS(args.start_clock_s + startMs / 1000)} → ${fmtHMS(args.start_clock_s + endMs / 1000)}`;
+  lblDur.textContent = "Duración: " + fmtDur(endMs - startMs);
+}
+
+function startDrag(e, mode) {
+  e.preventDefault();
+  e.stopPropagation();
+  const x = svgPoint(e.clientX);
+  drag = {
+    mode,
+    startX: x,
+    origStart: startMs,
+    origEnd: endMs,
+    grabOffsetMs: mode === "move" ? msForX(x) - startMs : 0,
+  };
+  e.target.setPointerCapture(e.pointerId);
+}
+
+function onPointerMove(e) {
+  if (!drag) return;
+  const x = svgPoint(e.clientX);
+  const ms = msForX(x);
+
+  if (drag.mode === "left") {
+    startMs = Math.min(Math.max(ms, 0), drag.origEnd - MIN_GAP_MS);
+    startMs = Math.max(startMs, 0);
+  } else if (drag.mode === "right") {
+    endMs = Math.max(Math.min(ms, args.duration_ms), drag.origStart + MIN_GAP_MS);
+    endMs = Math.min(endMs, args.duration_ms);
+  } else if (drag.mode === "move") {
+    const dur = drag.origEnd - drag.origStart;
+    let newStart = ms - drag.grabOffsetMs;
+    newStart = Math.min(Math.max(newStart, 0), args.duration_ms - dur);
+    startMs = newStart;
+    endMs = newStart + dur;
+  }
+  drawBand();
+}
+
+function onPointerUp(e) {
+  if (!drag) return;
+  drag = null;
+  commitValue();
+}
+
+function commitValue() {
+  window.parent.postMessage({
+    isStreamlitMessage: true,
+    type: "streamlit:setComponentValue",
+    value: { start_ms: Math.round(startMs), end_ms: Math.round(endMs) },
+  }, "*");
+}
+
+document.addEventListener("pointermove", onPointerMove);
+document.addEventListener("pointerup", onPointerUp);
+
+function setFrameHeight() {
+  const infoH = document.getElementById("info").offsetHeight;
+  const legendH = legendEl.offsetHeight;
+  const total = infoH + legendH + (vbH * (svg.getBoundingClientRect().width / VB_W)) + 12;
+  window.parent.postMessage({
+    isStreamlitMessage: true,
+    type: "streamlit:setFrameHeight",
+    height: Math.ceil(total),
+  }, "*");
+}
+
+function onRender(event) {
+  if (event.data.type !== "streamlit:render") return;
+  const newArgs = event.data.args;
+  const isFirst = args === null;
+  args = newArgs;
+  vbH = args.height || 240;
+
+  if (isFirst) {
+    startMs = args.start_ms;
+    endMs = args.end_ms;
+  }
+
+  render();
+  setTimeout(setFrameHeight, 0);
+
+  if (isFirst) {
+    commitValue();
+  }
+}
+
+window.addEventListener("message", onRender);
+window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:componentReady", apiVersion: 1 }, "*");
+window.addEventListener("resize", () => setTimeout(setFrameHeight, 0));
+</script>
+</body>
+</html>
