@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<style>
+  html, body {
+    margin: 0; padding: 0; background: transparent;
+    font-family: "Source Sans Pro", -apple-system, BlinkMacSystemFont, sans-serif;
+    color: #fafafa; user-select: none; -webkit-user-select: none; overflow: hidden;
+  }
+  #top { display: flex; gap: 10px; align-items: stretch; }
+  #map { flex: 1; min-width: 0; height: 420px; border-radius: 6px; background: #0e1117; }
+  #panel { width: 230px; height: 420px; overflow-y: auto; flex-shrink: 0; font-size: 12px; }
+  .card { border: 1px solid rgba(255,255,255,0.12); border-left-width: 3px; border-radius: 6px; padding: 6px 8px; margin-bottom: 8px; background: rgba(255,255,255,0.03); }
+  .card h4 { margin: 0 0 4px 0; font-size: 13px; }
+  .row { display: flex; justify-content: space-between; gap: 6px; padding: 1px 0; color: #b8b8b8; }
+  .row b { color: #fafafa; font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; }
+  .row.sel { color: #00CC96; }
+  @media (max-width: 700px) { #top { flex-direction: column; } #panel { width: auto; height: auto; max-height: 240px; } }
+  #controls { display: flex; align-items: center; gap: 8px; padding: 8px 4px 4px 4px; flex-wrap: wrap; font-size: 13px; color: #d0d0d0; }
+  #controls button, #controls select {
+    background: rgba(0,204,150,0.12); border: 1px solid rgba(0,204,150,0.5); color: #00CC96;
+    border-radius: 4px; padding: 3px 10px; font-size: 13px; cursor: pointer; font-family: inherit;
+  }
+  #controls button:hover { background: rgba(0,204,150,0.22); }
+  #controls select option { background: #1a1d24; color: #fafafa; }
+  #btn-play { min-width: 38px; font-size: 15px; }
+  .spd.active { background: rgba(0,204,150,0.38); color: #fff; }
+  #clock { margin-left: auto; font-variant-numeric: tabular-nums; }
+  #clock b { color: #00CC96; font-size: 14px; }
+  .legend { display: flex; gap: 12px; font-size: 11px; padding: 0 4px 2px 4px; flex-wrap: wrap; }
+  .legend span { display: inline-flex; align-items: center; gap: 4px; }
+  .legend i { width: 10px; height: 3px; display: inline-block; border-radius: 2px; }
+  svg { width: 100%; display: block; touch-action: none; cursor: pointer; }
+  .grid-line { stroke: rgba(255,255,255,0.08); stroke-width: 1; }
+  .series-line { fill: none; stroke-width: 1.6; opacity: 0.95; }
+  .axis-label { fill: rgba(255,255,255,0.55); font-size: 10px; }
+  .playhead { stroke: #fff; stroke-width: 1.5; }
+  .playhead-knob { fill: #00CC96; stroke: #08110e; stroke-width: 1; cursor: ew-resize; }
+  .boat-icon { background: none; border: none; }
+  #map canvas { display: block; cursor: grab; border-radius: 6px; }
+</style>
+</head>
+<body>
+<div id="top">
+  <div id="map"><canvas id="map-canvas"></canvas></div>
+  <div id="panel"></div>
+</div>
+<div id="controls">
+  <button id="btn-play" type="button" title="Reproducir / pausar">▶</button>
+  <button class="spd active" data-spd="1" type="button">1x</button>
+  <button class="spd" data-spd="2" type="button">2x</button>
+  <button class="spd" data-spd="4" type="button">4x</button>
+  <label>Dato:
+    <select id="metric"></select>
+  </label>
+  <span id="clock">⏱ <b id="lbl-clock">--:--:--</b></span>
+</div>
+<div class="legend" id="legend"></div>
+<svg id="chart" viewBox="0 0 1000 150" preserveAspectRatio="none"></svg>
+
+<div id="err" style="color:#ff6b6b;font-size:12px;padding:4px"></div>
+<script>
+function showErr(e) { document.getElementById("err").textContent = "Error: " + (e && e.message || e); }
+window.addEventListener("error", ev => showErr(ev.message));
+</script>
+<script>
+const NS = "http://www.w3.org/2000/svg";
+const VB_W = 1000, VB_H = 150, PAD_L = 6, PAD_R = 6, PAD_T = 8, PAD_B = 20;
+const plotW = VB_W - PAD_L - PAD_R, plotH = VB_H - PAD_T - PAD_B;
+
+let args = null, sig = null;
+
+let curMs = 0, playing = false, speed = 1, aheadS = 5, lastTs = null, dragging = false;
+let yMin = 0, yMax = 1, metric = null;
+
+const svg = document.getElementById("chart");
+const btnPlay = document.getElementById("btn-play");
+const lblClock = document.getElementById("lbl-clock");
+const metricSel = document.getElementById("metric");
+
+function fmtHMS(s) {
+  s = ((s % 86400) + 86400) % 86400;
+  return [Math.floor(s / 3600), Math.floor((s % 3600) / 60), Math.floor(s % 60)]
+    .map(v => String(v).padStart(2, "0")).join(":");
+}
+
+// índice i tal que t[i] <= x < t[i+1]
+function bsearch(arr, x) {
+  let lo = 0, hi = arr.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (arr[mid] <= x) lo = mid; else hi = mid - 1;
+  }
+  return lo;
+}
+
+function lerpAngle(a, b, f) {
+  const d = ((b - a + 540) % 360) - 180;
+  return (a + d * f + 360) % 360;
+}
+
+// posición en coordenadas de mundo interpolada entre muestras (ms acotado a la traza)
+function wposAt(r, ms) {
+  const n = r.t.length;
+  ms = Math.min(Math.max(ms, r.t[0]), r.t[n - 1]);
+  const i = bsearch(r.t, ms);
+  if (i >= n - 1) return [r.wx[n - 1], r.wy[n - 1]];
+  const f = (ms - r.t[i]) / ((r.t[i + 1] - r.t[i]) || 1);
+  return [r.wx[i] + (r.wx[i + 1] - r.wx[i]) * f, r.wy[i] + (r.wy[i + 1] - r.wy[i]) * f];
+}
+
+function posAt(r, ms) {
+  const n = r.t.length;
+  if (!n || ms < r.t[0] || ms > r.t[n - 1]) return null;
+  const i = bsearch(r.t, ms);
+  if (i >= n - 1) return { lat: r.lat[n - 1], lon: r.lon[n - 1], hdg: r.hdg ? r.hdg[n - 1] : 0 };
+  const f = (ms - r.t[i]) / ((r.t[i + 1] - r.t[i]) || 1);
+  return {
+    lat: r.lat[i] + (r.lat[i + 1] - r.lat[i]) * f,
+    lon: r.lon[i] + (r.lon[i + 1] - r.lon[i]) * f,
+    hdg: r.hdg ? lerpAngle(r.hdg[i], r.hdg[i + 1], f) : 0,
+  };
+}
+
+// ── Mapa propio en canvas (proyección Mercator + teselas opcionales) ─────────
+// Las líneas y el barco se dibujan siempre; las teselas son solo el fondo y, si
+// no cargan (sin red / bloqueadas), queda un fondo oscuro con cuadrícula.
+const cv = document.getElementById("map-canvas");
+const ctx = cv.getContext("2d");
+const TILE_URLS = [
+  "https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}.png",
+  "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+];
+const tileCache = new Map();
+let view = { cx: 0.5, cy: 0.5, scale: 256 };   // scale = px por unidad de mundo [0,1]
+let cw = 600, ch = 420, dirty = true, tileSrc = 0, tileOk = 0, tileFail = 0, mapDrag = null;
+const MAX_SCALE = 256 * Math.pow(2, 19);
+
+const mx = lon => (lon + 180) / 360;
+const my = lat => { const s = Math.sin(lat * Math.PI / 180); return 0.5 - Math.log((1 + s) / (1 - s)) / (4 * Math.PI); };
+
+function resizeCanvas() {
+  const r = cv.parentElement.getBoundingClientRect();
+  cw = Math.max(200, Math.round(r.width)); ch = Math.round(r.height) || 420;
+  const dpr = window.devicePixelRatio || 1;
+  cv.width = cw * dpr; cv.height = ch * dpr;
+  cv.style.width = cw + "px"; cv.style.height = ch + "px";
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  dirty = true;
+}
+
+function boatPath(c, x, y, ang, color) {
+  c.save(); c.translate(x, y); c.rotate(ang * Math.PI / 180);
+  c.beginPath(); c.moveTo(0, -9); c.lineTo(6, 8); c.lineTo(0, 4.5); c.lineTo(-6, 8); c.closePath();
+  c.fillStyle = color; c.fill(); c.lineWidth = 1.4; c.strokeStyle = "#fff"; c.lineJoin = "round"; c.stroke();
+  c.restore();
+}
+
+function buildMap() {
+  resizeCanvas();
+  let x0 = 1, x1 = 0, y0 = 1, y1 = 0;
+  args.racers.forEach(r => {
+    r.wx = r.lon.map(mx); r.wy = r.lat.map(my);
+    r.wx.forEach(v => { if (v < x0) x0 = v; if (v > x1) x1 = v; });
+    r.wy.forEach(v => { if (v < y0) y0 = v; if (v > y1) y1 = v; });
+  });
+  if (x1 < x0) { x0 = 0.4; x1 = 0.6; y0 = 0.4; y1 = 0.6; }
+  const w = Math.max(x1 - x0, 1e-6), h = Math.max(y1 - y0, 1e-6);
+  view = { cx: (x0 + x1) / 2, cy: (y0 + y1) / 2, scale: Math.min((cw - 60) / w, (ch - 60) / h) };
+  view.scale = Math.min(view.scale, MAX_SCALE);
+  dirty = true;
+}
+
+const sx = wx => (wx - view.cx) * view.scale + cw / 2;
+const sy = wy => (wy - view.cy) * view.scale + ch / 2;
+
+function getTile(z, x, y) {
+  const key = `${tileSrc}/${z}/${x}/${y}`;
+  let t = tileCache.get(key);
+  if (!t) {
+    t = new Image();
+    t.onload = () => { t.ok = true; tileOk++; dirty = true; };
+    t.onerror = () => {
+      t.failed = true; tileFail++;
+      if (!tileOk && tileFail >= 4 && tileSrc < TILE_URLS.length - 1) { tileSrc++; tileFail = 0; }  // prueba otro proveedor
+      dirty = true;
+    };
+    t.src = TILE_URLS[tileSrc].replace("{s}", "abcd"[(x + y) % 4]).replace("{z}", z).replace("{x}", x).replace("{y}", y);
+    tileCache.set(key, t);
+  }
+  return t;
+}
+
+function drawTiles() {
+  const z = Math.max(0, Math.min(18, Math.round(Math.log2(view.scale / 256))));
+  const n = Math.pow(2, z), tsz = view.scale / n;
+  const xa = Math.floor((view.cx - cw / 2 / view.scale) * n), xb = Math.floor((view.cx + cw / 2 / view.scale) * n);
+  const ya = Math.floor((view.cy - ch / 2 / view.scale) * n), yb = Math.floor((view.cy + ch / 2 / view.scale) * n);
+  if ((xb - xa + 1) * (yb - ya + 1) > 80) return;
+  for (let x = xa; x <= xb; x++) for (let y = ya; y <= yb; y++) {
+    if (y < 0 || y >= n) continue;
+    const t = getTile(z, ((x % n) + n) % n, y);
+    if (t.ok) ctx.drawImage(t, sx(x / n), sy(y / n), tsz + 0.5, tsz + 0.5);
+  }
+}
+
+function strokeTrack(r, i0, i1, color, width, alpha) {
+  ctx.globalAlpha = alpha; ctx.strokeStyle = color; ctx.lineWidth = width; ctx.lineJoin = "round"; ctx.lineCap = "round";
+  ctx.beginPath();
+  for (let i = i0; i <= i1; i++) { const x = sx(r.wx[i]), y = sy(r.wy[i]); if (i === i0) ctx.moveTo(x, y); else ctx.lineTo(x, y); }
+  ctx.stroke(); ctx.globalAlpha = 1;
+}
+
+function drawMap() {
+  ctx.fillStyle = "#0e1117"; ctx.fillRect(0, 0, cw, ch);
+  drawTiles();
+  if (!tileOk) {   // sin teselas: cuadrícula tenue
+    ctx.strokeStyle = "rgba(255,255,255,0.05)"; ctx.lineWidth = 1; ctx.beginPath();
+    for (let x = (cw / 2) % 60; x < cw; x += 60) { ctx.moveTo(x, 0); ctx.lineTo(x, ch); }
+    for (let y = (ch / 2) % 60; y < ch; y += 60) { ctx.moveTo(0, y); ctx.lineTo(cw, y); }
+    ctx.stroke();
+  }
+  // 1) recorrido completo, muy tenue
+  args.racers.forEach(r => { if (r.wx && r.wx.length > 1) strokeTrack(r, 0, r.wx.length - 1, r.color, 2, 0.2); });
+  // 2) traza por delante, opaca, + barco
+  args.racers.forEach(r => {
+    const p = r.wx && posAt(r, curMs);
+    if (!p) return;
+    // misma longitud (aheadS) por detrás y delante; los extremos se interpolan
+    // para que la cola y la cabeza avancen de forma continua, no a saltos de muestra
+    const tA = Math.max(curMs - aheadS * 1000, r.t[0]), tB = Math.min(curMs + aheadS * 1000, r.t[r.t.length - 1]);
+    const iA = bsearch(r.t, tA), i0 = bsearch(r.t, curMs), iB = bsearch(r.t, tB);
+    const px = sx(mx(p.lon)), py = sy(my(p.lat));
+    ctx.globalAlpha = 1; ctx.strokeStyle = r.color; ctx.lineWidth = 3.5; ctx.lineJoin = "round"; ctx.lineCap = "round";
+    const a0 = wposAt(r, tA), b0 = wposAt(r, tB);
+    ctx.beginPath(); ctx.moveTo(sx(a0[0]), sy(a0[1]));
+    for (let i = iA + 1; i <= i0; i++) ctx.lineTo(sx(r.wx[i]), sy(r.wy[i]));
+    ctx.lineTo(px, py);
+    for (let i = i0 + 1; i <= iB; i++) ctx.lineTo(sx(r.wx[i]), sy(r.wy[i]));
+    ctx.lineTo(sx(b0[0]), sy(b0[1]));
+    ctx.stroke();
+    boatPath(ctx, px, py, p.hdg || 0, r.color);
+  });
+  ctx.fillStyle = "rgba(255,255,255,0.45)"; ctx.font = "10px sans-serif"; ctx.textAlign = "right";
+  ctx.fillText(tileOk ? "© OpenStreetMap © CARTO · rueda: zoom · arrastrar: mover" : "rueda: zoom · arrastrar: mover (sin mapa base)", cw - 6, ch - 6);
+}
+
+function updateMap() { dirty = true; }
+(function loop() { if (dirty) { dirty = false; if (args) drawMap(); } requestAnimationFrame(loop); })();
+
+cv.addEventListener("pointerdown", e => { mapDrag = { x: e.clientX, y: e.clientY, cx: view.cx, cy: view.cy }; cv.setPointerCapture(e.pointerId); });
+cv.addEventListener("pointermove", e => {
+  if (!mapDrag) return;
+  view.cx = mapDrag.cx - (e.clientX - mapDrag.x) / view.scale;
+  view.cy = mapDrag.cy - (e.clientY - mapDrag.y) / view.scale;
+  dirty = true;
+});
+cv.addEventListener("pointerup", () => { mapDrag = null; });
+cv.addEventListener("pointercancel", () => { mapDrag = null; });
+cv.addEventListener("wheel", e => {
+  e.preventDefault();
+  const r = cv.getBoundingClientRect(), mxp = e.clientX - r.left, myp = e.clientY - r.top;
+  const wx = (mxp - cw / 2) / view.scale + view.cx, wy = (myp - ch / 2) / view.scale + view.cy;
+  view.scale = Math.min(Math.max(view.scale * Math.exp(-e.deltaY * 0.0015), 256), MAX_SCALE);
+  view.cx = wx - (mxp - cw / 2) / view.scale; view.cy = wy - (myp - ch / 2) / view.scale;
+  dirty = true;
+}, { passive: false });
+window.addEventListener("resize", () => { resizeCanvas(); });
+
+// ── Gráfica inferior ────────────────────────────────────────────────────────
+function xForMs(ms) { return PAD_L + (args.duration_ms ? ms / args.duration_ms : 0) * plotW; }
+function msForClientX(cx) {
+  const rect = svg.getBoundingClientRect();
+  const x = ((cx - rect.left) / rect.width) * VB_W;
+  return Math.min(Math.max((x - PAD_L) / plotW, 0), 1) * args.duration_ms;
+}
+function el(tag, attrs) {
+  const e = document.createElementNS(NS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  return e;
+}
+
+let playheadLine = null, playheadKnob = null;
+
+function buildChart() {
+  svg.innerHTML = "";
+  const span = (yMax - yMin) || 1;
+  const yFor = v => PAD_T + plotH - ((v - yMin) / span) * plotH;
+  for (let i = 0; i <= 4; i++) {
+    const v = yMin + (span / 4) * i, y = yFor(v);
+    svg.appendChild(el("line", { class: "grid-line", x1: PAD_L, x2: VB_W - PAD_R, y1: y, y2: y }));
+    const t = el("text", { class: "axis-label", x: PAD_L + 2, y: y - 2 });
+    t.textContent = Math.round(v);
+    svg.appendChild(t);
+  }
+  const ticks = 6;
+  for (let i = 0; i <= ticks; i++) {
+    const ms = (args.duration_ms / ticks) * i;
+    const t = el("text", { class: "axis-label", x: xForMs(ms), y: VB_H - 5,
+      "text-anchor": i === 0 ? "start" : i === ticks ? "end" : "middle" });
+    t.textContent = fmtHMS(args.start_clock_s + ms / 1000);
+    svg.appendChild(t);
+  }
+  args.racers.forEach(r => {
+    const m = r.metrics[metric];
+    if (!m) return;
+    let d = "", pen = false;
+    r.t.forEach((t, i) => {
+      const v = m.v[i];
+      if (v === null) { pen = false; return; }   // hueco: levanta el lápiz
+      d += `${pen ? "L" : "M"}${xForMs(t).toFixed(1)},${yFor(v).toFixed(1)}`;
+      pen = true;
+    });
+    svg.appendChild(el("path", { class: "series-line", d, stroke: r.color }));
+  });
+  playheadLine = el("line", { class: "playhead", y1: PAD_T, y2: PAD_T + plotH });
+  playheadKnob = el("circle", { class: "playhead-knob", r: 6, cy: PAD_T + plotH });
+  svg.appendChild(playheadLine);
+  svg.appendChild(playheadKnob);
+}
+
+function applyMetric() {
+  let lo = Infinity, hi = -Infinity;
+  args.racers.forEach(r => (r.metrics[metric] ? r.metrics[metric].v : []).forEach(v => {
+    if (v !== null) { if (v < lo) lo = v; if (v > hi) hi = v; }
+  }));
+  if (!isFinite(lo)) { lo = 0; hi = 1; }
+  if (lo > 0) lo = 0;            // la escala incluye el 0 salvo que todo sea negativo
+  if (hi < 0) hi = 0;
+  yMin = lo; yMax = hi;
+  buildChart();
+  updatePlayhead();
+  highlightMetric();
+}
+metricSel.addEventListener("change", () => { metric = metricSel.value; applyMetric(); });
+
+function updatePlayhead() {
+  const x = xForMs(curMs);
+  playheadLine.setAttribute("x1", x); playheadLine.setAttribute("x2", x);
+  playheadKnob.setAttribute("cx", x);
+  lblClock.textContent = fmtHMS(args.start_clock_s + curMs / 1000);
+}
+
+const panelEl = document.getElementById("panel");
+let cards = null;
+
+function buildPanel() {
+  panelEl.innerHTML = "";
+  cards = args.racers.map(r => {
+    const card = document.createElement("div");
+    card.className = "card";
+    card.style.borderLeftColor = r.color;
+    const rows = {};
+    let html = `<h4 style="color:${r.color}">${r.name}</h4>`;
+    const keys = [...Object.keys(r.metrics)];
+    if (r.fase) keys.push("Fase");
+    keys.forEach(k => {
+      const unit = k === "Fase" ? "" : r.metrics[k].unit;
+      html += `<div class="row" data-k="${k}"><span>${k}</span><b data-unit="${unit}">—</b></div>`;
+    });
+    card.innerHTML = html;
+    card.querySelectorAll(".row").forEach(row => { rows[row.dataset.k] = row; });
+    panelEl.appendChild(card);
+    return rows;
+  });
+  highlightMetric();
+}
+
+function highlightMetric() {
+  if (!cards) return;
+  cards.forEach(rows => Object.keys(rows).forEach(k => rows[k].classList.toggle("sel", k === metric)));
+}
+
+const CIRCULAR = new Set(["Rumbo (HDT)", "COG", "TWD"]);
+// valor interpolado entre la muestra i y la i+1 (suaviza el refresco entre datos de 1 Hz)
+function interpAt(vals, r, i, key) {
+  const a = vals[i], b = vals[i + 1];
+  if (a === null || a === undefined) return null;
+  if (b === null || b === undefined || i >= r.t.length - 1) return a;
+  const f = Math.min(Math.max((curMs - r.t[i]) / ((r.t[i + 1] - r.t[i]) || 1), 0), 1);
+  if (CIRCULAR.has(key)) {
+    let d = ((b - a + 540) % 360) - 180;
+    return (a + d * f + 360) % 360;
+  }
+  return a + (b - a) * f;
+}
+
+function updatePanel() {
+  args.racers.forEach((r, k) => {
+    const rows = cards[k], n = r.t.length;
+    const inside = n && curMs >= r.t[0] && curMs <= r.t[n - 1];
+    const i = inside ? bsearch(r.t, curMs) : -1;
+    Object.keys(rows).forEach(key => {
+      const b = rows[key].querySelector("b");
+      if (i < 0) { b.textContent = "—"; return; }
+      if (key === "Fase") { b.textContent = r.fase[i]; return; }
+      const v = interpAt(r.metrics[key].v, r, i, key);
+      const txt = v === null ? "—" : `${v.toFixed(1)}${b.dataset.unit ? " " + b.dataset.unit : ""}`;
+      if (b.textContent !== txt) b.textContent = txt;
+    });
+  });
+}
+
+function setTime(ms) {
+  curMs = Math.min(Math.max(ms, 0), args.duration_ms);
+  updatePlayhead();
+  updateMap();
+  updatePanel();
+}
+
+// ── Reproducción ────────────────────────────────────────────────────────────
+function setPlaying(p) {
+  playing = p;
+  btnPlay.textContent = p ? "⏸" : "▶";
+  lastTs = null;
+  if (p) {
+    if (curMs >= args.duration_ms - 1) setTime(0);
+    requestAnimationFrame(tick);
+  }
+}
+function tick(ts) {
+  if (!playing) return;
+  if (lastTs !== null && !dragging) {
+    setTime(curMs + (ts - lastTs) * speed);
+    if (curMs >= args.duration_ms) { setPlaying(false); return; }
+  }
+  lastTs = ts;
+  requestAnimationFrame(tick);
+}
+
+btnPlay.addEventListener("click", () => setPlaying(!playing));
+document.querySelectorAll(".spd").forEach(b => b.addEventListener("click", () => {
+  speed = Number(b.dataset.spd);
+  document.querySelectorAll(".spd").forEach(x => x.classList.toggle("active", x === b));
+}));
+
+svg.addEventListener("pointerdown", e => {
+  dragging = true;
+  svg.setPointerCapture(e.pointerId);
+  setTime(msForClientX(e.clientX));
+});
+svg.addEventListener("pointermove", e => { if (dragging) setTime(msForClientX(e.clientX)); });
+svg.addEventListener("pointerup", () => { dragging = false; });
+svg.addEventListener("pointercancel", () => { dragging = false; });
+
+// ── Streamlit protocol ──────────────────────────────────────────────────────
+function setFrameHeight() {
+  window.parent.postMessage({
+    isStreamlitMessage: true, type: "streamlit:setFrameHeight",
+    height: document.documentElement.scrollHeight,
+  }, "*");
+}
+
+async function onRender(event) {
+  if (event.data.type !== "streamlit:render") return;
+  try { render(event); } catch (e) { showErr(e); }
+}
+
+function render(event) {
+  const newArgs = event.data.args;
+  const newSig = JSON.stringify([newArgs.duration_ms, newArgs.racers.map(r => [r.name, r.t.length, r.t[0], r.t[r.t.length - 1]])]);
+  if (newSig === sig) return;  // mismo dato: no reiniciar reproducción
+  sig = newSig;
+  args = newArgs;
+  const names = [];
+  args.racers.forEach(r => Object.keys(r.metrics).forEach(k => { if (!names.includes(k)) names.push(k); }));
+  const prev = metric;
+  metricSel.innerHTML = names.map(n => `<option>${n}</option>`).join("");
+  metric = names.includes(prev) ? prev : names[0];
+  metricSel.value = metric;
+  document.getElementById("legend").innerHTML = args.racers
+    .map(r => `<span><i style="background:${r.color}"></i>${r.name}</span>`).join("");
+  setPlaying(false);
+  buildMap();
+  buildPanel();
+  applyMetric();
+  setTime(0);
+  setTimeout(setFrameHeight, 0);
+  setTimeout(() => { resizeCanvas(); buildMap(); }, 100);
+}
+
+window.addEventListener("message", onRender);
+window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:componentReady", apiVersion: 1 }, "*");
+window.addEventListener("resize", () => setTimeout(setFrameHeight, 0));
+</script>
+</body>
+</html>

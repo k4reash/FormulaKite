@@ -33,6 +33,77 @@ def time_range_selector(series, duration_ms, start_clock_s, start_ms, end_ms, he
         default=None,
     )
 
+
+_track_replay_component = components.declare_component(
+    "track_replay",
+    path=os.path.join(_COMPONENTS_DIR, "track_replay"),
+)
+
+
+REPLAY_METRICS = [  # (etiqueta, columna, unidad) — datos elegibles en la gráfica del replay
+    ("Velocidad (SOG)", "SOG_kts", "kts"),
+    ("VMG", "VMG_kts", "kts"),
+    ("TWA", "TWA", "°"),
+    ("Heel", "Heel", "°"),
+    ("Rumbo (HDT)", "HDT", "°"),
+    ("COG", "COG", "°"),
+    ("TWD", "TWD", "°"),
+    ("Trim proa/popa", "Trim Fore / Aft", "°"),
+]
+
+
+def build_replay_racers(dfs, max_points=8000):
+    """Serializa los tracks para el componente de replay: tiempos relativos (ms) al
+    primer instante de `dfs`, lat/lon, SOG y rumbo (grados) calculado entre puntos."""
+    valid = [d for d in dfs if {"time", "latitude", "longitude"} <= set(d.columns)]
+    if not valid:
+        return [], 0.0, 0.0
+    t_min = min(d["time"].min() for d in valid)
+    t_max = max(d["time"].max() for d in valid)
+    racers = []
+    for i, d in enumerate(valid):
+        dd = d.dropna(subset=["time", "latitude", "longitude"]).sort_values("time")
+        if len(dd) > max_points:
+            dd = dd.iloc[:: int(np.ceil(len(dd) / max_points))]
+        if dd.empty:
+            continue
+        lat = dd["latitude"].to_numpy(float)
+        lon = dd["longitude"].to_numpy(float)
+        dlat = np.gradient(lat)
+        dlon = np.gradient(lon) * np.cos(np.radians(lat))
+        hdg = (np.degrees(np.arctan2(dlon, dlat)) + 360) % 360
+        metrics = {}
+        for label, col, unit in REPLAY_METRICS:
+            if col in dd.columns:
+                vals = pd.to_numeric(dd[col], errors="coerce").round(1)
+                metrics[label] = {"unit": unit, "v": [None if pd.isna(v) else float(v) for v in vals]}
+        racers.append({
+            "name": str(d["Regatista"].iloc[0]) if "Regatista" in d.columns else f"Regatista {i + 1}",
+            "color": RACER_PALETTE[i % len(RACER_PALETTE)],
+            "t": ((dd["time"] - t_min).dt.total_seconds() * 1000).round().tolist(),
+            "lat": lat.round(6).tolist(),
+            "lon": lon.round(6).tolist(),
+            "metrics": metrics,
+            "fase": dd["Fase"].fillna("—").astype(str).tolist() if "Fase" in dd.columns else None,
+            "hdg": np.nan_to_num(hdg).round(0).tolist(),
+        })
+    duration_ms = (t_max - t_min).total_seconds() * 1000
+    start_clock_s = t_min.hour * 3600 + t_min.minute * 60 + t_min.second
+    return racers, duration_ms, start_clock_s
+
+
+def track_replay(racers, duration_ms, start_clock_s, ahead_s=5, key=None):
+    """Mapa representativo (solo línea por delante) + gráfica inferior que fija la
+    posición del track, con Play y velocidades 1x/2x/4x."""
+    return _track_replay_component(
+        racers=racers,
+        duration_ms=duration_ms,
+        start_clock_s=start_clock_s,
+        ahead_s=ahead_s,
+        key=key,
+        default=None,
+    )
+
 # ─── Configuración de página ─────────────────────────────────────────────────
 st.set_page_config(
     page_title="Formula Kite Analytics",
@@ -328,7 +399,11 @@ def _dark_layout(extra=None):
     return base
 
 
-def build_map(dfs, color_by="Velocidad"):
+def build_map(dfs, color_by="Velocidad", view=None):
+    """`view`, si se pasa, fija el centro/zoom inicial (p. ej. calculado una sola vez
+    sobre la traza completa) en vez de recalcularlo del subconjunto `dfs` actual —
+    así el mapa no se recentra cada vez que `dfs` cambia (p. ej. al mover el slider
+    de tramo)."""
     fig = go.Figure()
 
     for idx, df in enumerate(dfs):
@@ -336,7 +411,7 @@ def build_map(dfs, color_by="Velocidad"):
         color = RACER_PALETTE[idx % len(RACER_PALETTE)]
 
         def _build_customdata(src):
-            """Construye customdata con cols: [0]SOG [1]VMG [2]TWA [3]Fase [4]Hora."""
+            """Construye customdata con cols: [0]SOG [1]VMG [2]TWA [3]Fase [4]Hora [5]Heel."""
             n = pd.RangeIndex(len(src))
             _idx = src.index
 
@@ -349,8 +424,9 @@ def build_map(dfs, color_by="Velocidad"):
             fase = src["Fase"].fillna("—")      if "Fase"   in src.columns else pd.Series(["—"] * len(src), index=_idx)
             hora = (src["time"].dt.strftime("%H:%M:%S").fillna("—")
                     if "time" in src.columns else pd.Series(["—"] * len(src), index=_idx))
+            heel = _fmt(src["Heel"],   ".1f") if "Heel"    in src.columns else pd.Series(["—"] * len(src), index=_idx)
             return np.column_stack([sog.values, vmg.values, twa.values,
-                                    fase.values, hora.values])
+                                    fase.values, hora.values, heel.values])
 
         if color_by == "Velocidad" and "SOG_kts" in df.columns:
             fig.add_trace(go.Scattermapbox(
@@ -368,6 +444,33 @@ def build_map(dfs, color_by="Velocidad"):
                 customdata=_build_customdata(df),
                 hovertemplate=(
                     f"<b>{name}</b><br>"
+                    "SOG: %{customdata[0]} kts<br>"
+                    "VMG: %{customdata[1]} kts<br>"
+                    "TWA: %{customdata[2]}°<br>"
+                    "Fase: %{customdata[3]}<br>"
+                    "Heel: %{customdata[5]}°<br>"
+                    "⏱ %{customdata[4]}<extra></extra>"
+                ),
+            ))
+        elif color_by == "Heel" and "Heel" in df.columns:
+            _heel_max = float(df["Heel"].abs().quantile(0.99)) or 1.0
+            fig.add_trace(go.Scattermapbox(
+                lat=df["latitude"], lon=df["longitude"], mode="markers",
+                marker=dict(
+                    size=5,
+                    color=df["Heel"],
+                    colorscale="RdBu_r",
+                    showscale=(idx == 0),
+                    colorbar=dict(title="Heel (°)") if idx == 0 else None,
+                    cmin=-_heel_max,
+                    cmax=_heel_max,
+                    cmid=0,
+                ),
+                name=name,
+                customdata=_build_customdata(df),
+                hovertemplate=(
+                    f"<b>{name}</b><br>"
+                    "Heel: %{customdata[5]}°<br>"
                     "SOG: %{customdata[0]} kts<br>"
                     "VMG: %{customdata[1]} kts<br>"
                     "TWA: %{customdata[2]}°<br>"
@@ -390,6 +493,7 @@ def build_map(dfs, color_by="Velocidad"):
                         "SOG: %{customdata[0]} kts<br>"
                         "VMG: %{customdata[1]} kts<br>"
                         "TWA: %{customdata[2]}°<br>"
+                        "Heel: %{customdata[5]}°<br>"
                         "⏱ %{customdata[4]}<extra></extra>"
                     ),
                 ))
@@ -397,15 +501,31 @@ def build_map(dfs, color_by="Velocidad"):
             fig.add_trace(go.Scattermapbox(
                 lat=df["latitude"], lon=df["longitude"], mode="markers",
                 marker=dict(size=5, color=color), name=name,
+                customdata=_build_customdata(df),
+                hovertemplate=(
+                    f"<b>{name}</b><br>"
+                    "SOG: %{customdata[0]} kts<br>"
+                    "VMG: %{customdata[1]} kts<br>"
+                    "TWA: %{customdata[2]}°<br>"
+                    "Heel: %{customdata[5]}°<br>"
+                    "⏱ %{customdata[4]}<extra></extra>"
+                ),
             ))
 
-    all_lat = pd.concat([d["latitude"] for d in dfs])
-    all_lon = pd.concat([d["longitude"] for d in dfs])
+    if view is not None:
+        center = dict(lat=view["lat"], lon=view["lon"])
+        zoom = view["zoom"]
+    else:
+        all_lat = pd.concat([d["latitude"] for d in dfs])
+        all_lon = pd.concat([d["longitude"] for d in dfs])
+        center = dict(lat=float(all_lat.mean()), lon=float(all_lon.mean()))
+        zoom = 12
     fig.update_layout(
         mapbox=dict(
             style="carto-darkmatter",
-            center=dict(lat=float(all_lat.mean()), lon=float(all_lon.mean())),
-            zoom=12,
+            center=center,
+            zoom=zoom,
+            uirevision="race_map",
         ),
         margin=dict(l=0, r=0, t=0, b=0),
         height=520,
@@ -1244,6 +1364,26 @@ def _trim_dialog():
     _duration_ms = (_t_max - _t_min).total_seconds() * 1000
     _start_clock_s = _t_min.hour * 3600 + _t_min.minute * 60 + _t_min.second
 
+    # Si ya se había confirmado un tramo antes (p. ej. al añadir otro regatista a
+    # una sesión ya recortada), ofrece reutilizarlo directamente en vez de tener
+    # que volver a arrastrar el slider.
+    _last_range = st.session_state.get("_last_confirmed_range")
+    if _last_range and not st.session_state.get("trim_range"):
+        _lo, _hi = _last_range
+        if _lo < _t_max and _hi > _t_min:  # solapa con la sesión de los archivos actuales
+            _clamped_lo = max(_lo, _t_min)
+            _clamped_hi = min(_hi, _t_max)
+            st.info(
+                "📎 Ya habías recortado un tramo antes: "
+                f"**{_clamped_lo.strftime('%H:%M:%S')} → {_clamped_hi.strftime('%H:%M:%S')}**"
+            )
+            if st.button("✅ Usar ese mismo tramo para todos los regatistas", type="primary"):
+                st.session_state["trim_range"] = (_clamped_lo, _clamped_hi)
+                st.session_state["_last_confirmed_range"] = (_clamped_lo, _clamped_hi)
+                st.session_state["trim_confirmed_for"] = _files_key
+                st.rerun()
+            st.divider()
+
     _prev_range = st.session_state.get("trim_range")
     if _prev_range:
         _default_start_ms = (_prev_range[0] - _t_min).total_seconds() * 1000
@@ -1289,8 +1429,17 @@ def _trim_dialog():
     if not _preview:
         st.warning("Sin datos en el tramo seleccionado.")
     elif _has_gps_full:
+        # Centro/zoom fijos, calculados sobre la traza COMPLETA (no el tramo
+        # visible), para que el mapa no se recentre al mover el slider.
+        _full_lat = pd.concat([d["latitude"] for d in dfs_full])
+        _full_lon = pd.concat([d["longitude"] for d in dfs_full])
+        _map_view = {
+            "lat": float(_full_lat.mean()),
+            "lon": float(_full_lon.mean()),
+            "zoom": 12,
+        }
         st.plotly_chart(
-            build_map(_preview, "Velocidad"),
+            build_map(_preview, "Velocidad", view=_map_view),
             use_container_width=True,
             config={"scrollZoom": True},
             key="trim_preview_map",
@@ -1306,6 +1455,7 @@ def _trim_dialog():
     with c1:
         if st.button("✅ Confirmar tramo y analizar", type="primary", disabled=not _preview):
             st.session_state["trim_range"] = (_t0, _t1)
+            st.session_state["_last_confirmed_range"] = (_t0, _t1)
             st.session_state["trim_confirmed_for"] = _files_key
             st.rerun()
     with c2:
@@ -1393,14 +1543,14 @@ has_gps = all("latitude" in d.columns and "longitude" in d.columns for d in dfs)
 if has_gps:
     section("🗺️ Mapa de Tracks GPS")
 
-    map_c1, map_c2 = st.columns([1, 3])
-    with map_c1:
-        color_by = st.radio("Colorear por:", ["Velocidad", "Fase"], horizontal=True)
-
-    st.plotly_chart(
-        build_map(dfs, color_by),
-        use_container_width=True,
-        config={"scrollZoom": True},
+    st.caption(
+        "El mapa muestra solo el trazado por delante de la posición actual. "
+        "Arrastra el cursor de la gráfica inferior o pulsa ▶ para avanzar."
+    )
+    _replay_racers, _replay_dur, _replay_clock = build_replay_racers(dfs)
+    track_replay(
+        _replay_racers, _replay_dur, _replay_clock,
+        key=f"track_replay_{hash(_files_key)}_{hash(str(st.session_state.get('trim_range')))}",
     )
 
 else:
