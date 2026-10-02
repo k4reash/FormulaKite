@@ -154,7 +154,12 @@ RECOVERY_FRAC   = 0.90  # recovery: hasta recuperar el 90 % de la SOG de entrada
 DROP_START_FRAC = 0.95  # la caída empieza cuando la SOG baja del 95 % de la de entrada
 ENTRY_WINDOW_S  = (15, 5)  # SOG de entrada: media entre 15 y 5 s antes del cambio de amura
 EXIT_WINDOW_S   = (20, 40)  # SOG de salida: mediana entre 20 y 40 s después (rumbo ya estable)
-FOIL_FLIGHT_KTS = 8   # por debajo de este umbral el foil no vuela (maniobra fallida / Caída)
+FOIL_FLIGHT_KTS = 6   # por debajo de este umbral el foil no vuela. Estimado de los CSV: el vuelo
+                      # sostenido empieza en ~9 kts, 5-8 kts son solo transitorios y hay maniobras
+                      # sin caída con SOG mín de 6.7 kts
+FALL_KTS        = 3   # maniobra fallida (caída al agua) solo si la SOG baja de aquí; una maniobra
+                      # lenta puede pasar por 6-8 kts sin caerse
+REFLY_S         = 5   # tras una caída, s seguidos en vuelo para considerar que vuelve a volar
 PHASE_SMOOTH_S  = 5   # ventana (s) de la mediana móvil aplicada a SOG y |TWA|
 PHASE_MIN_S     = 5   # un tramo más corto entre dos tramos de la misma fase se absorbe (parpadeo A-B-A)
 TWA_UPWIND_MAX   = 70   # |TWA| < 70° → Ceñida
@@ -658,7 +663,7 @@ def detect_maneuvers(df: pd.DataFrame) -> pd.DataFrame:
 
             row = {
                 "Tipo":            mtype,
-                "Estado":          "🔴 Fallida" if min_sog < FOIL_FLIGHT_KTS else "✅ OK",
+                "Estado":          "🔴 Fallida" if min_sog < FALL_KTS else "✅ OK",
                 "SOG antes (kts)": round(sog_before, 1),
                 "SOG mín (kts)":   round(min_sog, 1),
                 "Caída (kts)":     round(sog_before - min_sog, 1),
@@ -672,7 +677,15 @@ def detect_maneuvers(df: pd.DataFrame) -> pd.DataFrame:
                 row["lon"] = float(df["longitude"].iloc[i])
 
             rows.append(row)
-            i += GAP
+            if min_sog < FALL_KTS:
+                # Tras una caída el TWA oscila con el regatista en el agua: no buscar otra
+                # maniobra hasta que vuelva a volar de forma sostenida (no un pico suelto)
+                flying = np.convolve(sog[min_idx:] >= FOIL_FLIGHT_KTS,
+                                     np.ones(REFLY_S, dtype=int), "valid") == REFLY_S
+                back = np.flatnonzero(flying)
+                i = max(i + GAP, min_idx + int(back[0])) if back.size else len(twa)
+            else:
+                i += GAP
             continue
         i += 1
 
@@ -1072,7 +1085,7 @@ def build_heel_analysis(dfs):
         **_dark_layout({
             "height": 420,
             "title": dict(
-                text="Escora vs Velocidad por Fase · SOG media (foil en vuelo ≥ 8 kts)",
+                text=f"Escora vs Velocidad por Fase · SOG media (foil en vuelo ≥ {FOIL_FLIGHT_KTS} kts)",
                 font=dict(color="#e2e8f0"),
             ),
         }),
@@ -1904,7 +1917,9 @@ if has_gps:
 
     st.caption(
         "El mapa muestra solo el trazado por delante de la posición actual. "
-        "Arrastra el cursor de la gráfica inferior o pulsa ▶ para avanzar."
+        "Arrastra el cursor de la gráfica inferior o pulsa ▶ para avanzar. "
+        "La brújula marca hacia dónde sopla el viento (TWD) y la línea perpendicular al viento "
+        "marca al líder, con la distancia que saca a cada uno medida en el eje del viento (como Sailmon)."
     )
     _replay_racers, _replay_dur, _replay_clock = build_replay_racers(dfs)
     track_replay(
@@ -1981,7 +1996,7 @@ has_heel = any("Heel" in d.columns for d in dfs)
 if has_heel:
     section("⛵ Escora (Heel) vs Velocidad")
     st.caption(
-        "SOG media agrupada en bins de 2° de escora, filtrada solo cuando el foil vuela (≥ 8 kts). "
+        f"SOG media agrupada en bins de 2° de escora, filtrada solo cuando el foil vuela (≥ {FOIL_FLIGHT_KTS} kts). "
         "Permite identificar el **ángulo de Heel óptimo** para maximizar velocidad."
     )
     heel_fig = build_heel_analysis(dfs)
@@ -2115,7 +2130,7 @@ for df in dfs:
         )
         cm4.metric("Caída SOG media", f"{man['Caída (kts)'].mean():.1f} kts")
         cm5.metric("🔴 Fallidas",       len(failed),
-                   help="Maniobras en las que la velocidad bajó por debajo de 8 kts (foil sin vuelo).")
+                   help=f"Maniobras en las que la velocidad bajó de {FALL_KTS} kts (caída al agua).")
 
         # Tabla de maniobras
         disp_cols = [
@@ -2135,8 +2150,8 @@ for df in dfs:
             ),
             "Estado": st.column_config.TextColumn(
                 "Estado",
-                help="**✅ OK:** el foil mantuvo vuelo durante toda la maniobra (SOG mín ≥ 8 kts). "
-                     "**🔴 Fallida:** la velocidad bajó por debajo de 8 kts, el foil tocó el agua.",
+                help=f"**✅ OK:** la maniobra se completó sin caída (SOG mín ≥ {FALL_KTS} kts). "
+                     f"**🔴 Fallida:** la velocidad bajó de {FALL_KTS} kts, el regatista se cayó.",
             ),
             "SOG antes (kts)": st.column_config.NumberColumn(
                 "SOG antes (kts)",

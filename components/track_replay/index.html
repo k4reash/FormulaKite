@@ -20,21 +20,19 @@
       }
       #top {
         display: flex;
-        gap: 10px;
-        align-items: stretch;
+        flex-direction: column;
+        gap: 8px;
       }
       #map {
-        flex: 1;
         min-width: 0;
         height: 420px;
         border-radius: 6px;
         background: #0e1117;
       }
       #panel {
-        width: 230px;
-        height: 420px;
-        overflow-y: auto;
-        flex-shrink: 0;
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 8px;
         font-size: 12px;
       }
       .card {
@@ -42,8 +40,12 @@
         border-left-width: 3px;
         border-radius: 6px;
         padding: 6px 8px;
-        margin-bottom: 8px;
         background: rgba(255, 255, 255, 0.03);
+      }
+      .card .rows {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        column-gap: 12px;
       }
       .card h4 {
         margin: 0 0 4px 0;
@@ -65,14 +67,9 @@
       .row.sel {
         color: #00cc96;
       }
-      @media (max-width: 700px) {
-        #top {
-          flex-direction: column;
-        }
-        #panel {
-          width: auto;
-          height: auto;
-          max-height: 240px;
+      @media (max-width: 480px) {
+        .card .rows {
+          grid-template-columns: 1fr;
         }
       }
       #controls {
@@ -106,7 +103,8 @@
         min-width: 38px;
         font-size: 15px;
       }
-      .spd.active {
+      .spd.active,
+      #btn-follow.active {
         background: rgba(0, 204, 150, 0.38);
         color: #fff;
       }
@@ -178,8 +176,8 @@
   </head>
   <body>
     <div id="top">
-      <div id="map"><canvas id="map-canvas"></canvas></div>
       <div id="panel"></div>
+      <div id="map"><canvas id="map-canvas"></canvas></div>
     </div>
     <div id="controls">
       <select id="metric"></select>
@@ -188,6 +186,13 @@
       <button class="spd active" data-spd="1" type="button">1x</button>
       <button class="spd" data-spd="2" type="button">2x</button>
       <button class="spd" data-spd="4" type="button">4x</button>
+      <button
+        id="btn-follow"
+        type="button"
+        title="Centrar y encuadrar el mapa en los regatistas mientras se mueven"
+      >
+        🎯 Seguir
+      </button>
       <span id="clock">⏱ <b id="lbl-clock">--:--:--</b></span>
     </div>
     <div class="legend" id="legend"></div>
@@ -289,6 +294,49 @@
         };
       }
 
+      // valor de una métrica del regatista en curMs (null si no hay dato o está fuera de su traza)
+      function metricAt(r, key) {
+        const n = r.t.length;
+        if (!r.metrics || !r.metrics[key] || !n) return null;
+        if (curMs < r.t[0] || curMs > r.t[n - 1]) return null;
+        return interpAt(r.metrics[key].v, r, bsearch(r.t, curMs), key);
+      }
+
+      // TWD media (circular) de los regatistas con dato en curMs
+      function windAt() {
+        let s = 0,
+          c = 0,
+          k = 0;
+        args.racers.forEach((r) => {
+          const v = metricAt(r, "TWD");
+          if (v === null) return;
+          s += Math.sin((v * Math.PI) / 180);
+          c += Math.cos((v * Math.PI) / 180);
+          k++;
+        });
+        if (!k) return null;
+        return ((Math.atan2(s, c) * 180) / Math.PI + 360) % 360;
+      }
+
+      // ceñida (gana el más a barlovento) o popa (el más a sotavento), con histéresis
+      let lastLeg = "up";
+      function legMode() {
+        let s = 0,
+          k = 0;
+        args.racers.forEach((r) => {
+          const v = metricAt(r, "TWA");
+          if (v === null) return;
+          s += Math.cos((v * Math.PI) / 180);
+          k++;
+        });
+        if (k) {
+          const m = s / k;
+          if (m > 0.2) lastLeg = "up";
+          else if (m < -0.2) lastLeg = "down";
+        }
+        return lastLeg;
+      }
+
       // ── Mapa propio en canvas (proyección Mercator + teselas opcionales) ─────────
       // Las líneas y el barco se dibujan siempre; las teselas son solo el fondo y, si
       // no cargan (sin red / bloqueadas), queda un fondo oscuro con cuadrícula.
@@ -333,14 +381,14 @@
         c.translate(x, y);
         c.rotate((ang * Math.PI) / 180);
         c.beginPath();
-        c.moveTo(0, -9);
-        c.lineTo(6, 8);
-        c.lineTo(0, 4.5);
-        c.lineTo(-6, 8);
+        c.moveTo(0, -11);
+        c.lineTo(3.5, 8);
+        c.lineTo(0, 5);
+        c.lineTo(-3.5, 8);
         c.closePath();
         c.fillStyle = color;
         c.fill();
-        c.lineWidth = 1.4;
+        c.lineWidth = 1.2;
         c.strokeStyle = "#fff";
         c.lineJoin = "round";
         c.stroke();
@@ -452,6 +500,104 @@
         ctx.globalAlpha = 1;
       }
 
+      function drawTag(text, x, y, color) {
+        ctx.font = "bold 11px sans-serif";
+        ctx.textAlign = "left";
+        ctx.textBaseline = "middle";
+        const w = ctx.measureText(text).width + 8;
+        ctx.fillStyle = "rgba(14,17,23,0.8)";
+        ctx.fillRect(x, y - 8, w, 16);
+        ctx.fillStyle = color;
+        ctx.fillText(text, x + 4, y);
+        ctx.textBaseline = "alphabetic";
+      }
+
+      // líder = el más a barlovento en ceñida / más a sotavento en popa; distancia en el eje del viento
+      function drawLadder(boats, twd) {
+        const rad = (twd * Math.PI) / 180,
+          ux = Math.sin(rad),
+          uy = Math.cos(rad);
+        const lat0 = boats[0].p.lat,
+          lon0 = boats[0].p.lon,
+          kx = Math.cos((lat0 * Math.PI) / 180) * 111320;
+        boats.forEach((b) => {
+          const e = (b.p.lon - lon0) * kx,
+            nn = (b.p.lat - lat0) * 110540;
+          b.up = e * ux + nn * uy; // metros avanzados hacia el viento
+        });
+        const sign = legMode() === "up" ? 1 : -1;
+        const lead = boats.reduce((a, b) => (b.up * sign > a.up * sign ? b : a));
+        // dirección de la línea en pantalla: perpendicular al viento (Mercator es conforme)
+        const dx = Math.cos(rad),
+          dy = Math.sin(rad);
+        const line = (b, len, width, alpha, dash) => {
+          ctx.globalAlpha = alpha;
+          ctx.strokeStyle = b.r.color;
+          ctx.lineWidth = width;
+          ctx.setLineDash(dash);
+          ctx.beginPath();
+          ctx.moveTo(b.px - dx * len, b.py - dy * len);
+          ctx.lineTo(b.px + dx * len, b.py + dy * len);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.globalAlpha = 1;
+        };
+        boats.forEach((b) => {
+          if (b !== lead) line(b, 120, 1.2, 0.55, [5, 4]);
+        });
+        line(lead, cw + ch, 2, 0.9, []);
+        boats.forEach((b) => {
+          const txt =
+            b === lead
+              ? `1º ${b.r.name}`
+              : `−${Math.round(Math.abs(lead.up - b.up))} m`;
+          drawTag(txt, b.px + 10, b.py - 12, b.r.color);
+        });
+      }
+
+      // brújula: la flecha apunta hacia donde sopla (el viento viene de la TWD)
+      function drawWind(twd) {
+        const cx = 34,
+          cy = 34,
+          R = 22;
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = "rgba(14,17,23,0.75)";
+        ctx.strokeStyle = "rgba(255,255,255,0.35)";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.arc(cx, cy, R, 0, 2 * Math.PI);
+        ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = "rgba(255,255,255,0.6)";
+        ctx.font = "9px sans-serif";
+        ctx.textAlign = "center";
+        ctx.fillText("N", cx, cy - R + 9);
+        ctx.font = "bold 11px sans-serif";
+        if (twd === null) {
+          ctx.fillText("Sin viento", cx + 2, cy + R + 14);
+          return;
+        }
+        ctx.save();
+        ctx.translate(cx, cy);
+        ctx.rotate(((twd + 180) * Math.PI) / 180);
+        ctx.strokeStyle = "#7dd3fc";
+        ctx.fillStyle = "#7dd3fc";
+        ctx.lineWidth = 2.5;
+        ctx.beginPath();
+        ctx.moveTo(0, R - 6);
+        ctx.lineTo(0, -R + 10);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(0, -R + 4);
+        ctx.lineTo(5, -R + 12);
+        ctx.lineTo(-5, -R + 12);
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+        ctx.fillStyle = "#7dd3fc";
+        ctx.fillText(`TWD ${Math.round(twd)}°`, cx, cy + R + 14);
+      }
+
       function drawMap() {
         ctx.fillStyle = "#0e1117";
         ctx.fillRect(0, 0, cw, ch);
@@ -476,7 +622,8 @@
           if (r.wx && r.wx.length > 1)
             strokeTrack(r, 0, r.wx.length - 1, r.color, 2, 0.2);
         });
-        // 2) traza por delante, opaca, + barco
+        // 2) traza por delante, opaca (los barcos se pintan después, encima de la línea de líder)
+        const boats = [];
         args.racers.forEach((r) => {
           const p = r.wx && posAt(r, curMs);
           if (!p) return;
@@ -505,8 +652,13 @@
             ctx.lineTo(sx(r.wx[i]), sy(r.wy[i]));
           ctx.lineTo(sx(b0[0]), sy(b0[1]));
           ctx.stroke();
-          boatPath(ctx, px, py, p.hdg || 0, r.color);
+          boats.push({ r, p, px, py });
         });
+        // 3) línea de líder perpendicular al viento (como Sailmon) + barcos + viento
+        const twd = windAt();
+        if (twd !== null && boats.length >= 2) drawLadder(boats, twd);
+        boats.forEach((b) => boatPath(ctx, b.px, b.py, b.p.hdg || 0, b.r.color));
+        drawWind(twd);
         ctx.fillStyle = "rgba(255,255,255,0.45)";
         ctx.font = "10px sans-serif";
         ctx.textAlign = "right";
@@ -522,7 +674,62 @@
       function updateMap() {
         dirty = true;
       }
+      // ── Seguimiento: encuadra a los regatistas activos y acompaña su movimiento ──
+      const FOLLOW_MIN_M = 250; // encuadre mínimo (m) para no hacer zoom excesivo con un solo barco
+      const btnFollow = document.getElementById("btn-follow");
+      let follow = false;
+      function setFollow(on) {
+        follow = on;
+        btnFollow.classList.toggle("active", on);
+        dirty = true;
+      }
+      btnFollow.addEventListener("click", () => setFollow(!follow));
+
+      function followStep() {
+        let x0 = 1,
+          x1 = 0,
+          y0 = 1,
+          y1 = 0,
+          lat = 0;
+        args.racers.forEach((r) => {
+          const p = r.wx && posAt(r, curMs);
+          if (!p) return;
+          const x = mx(p.lon),
+            y = my(p.lat);
+          x0 = Math.min(x0, x);
+          x1 = Math.max(x1, x);
+          y0 = Math.min(y0, y);
+          y1 = Math.max(y1, y);
+          lat = p.lat;
+        });
+        if (x1 < x0) return;
+        // metros → unidades de mundo Mercator en esta latitud
+        const minW = FOLLOW_MIN_M / (40075016.686 * Math.cos((lat * Math.PI) / 180));
+        const w = Math.max(x1 - x0, minW),
+          h = Math.max(y1 - y0, minW);
+        const tScale = Math.min((cw - 120) / w, (ch - 120) / h, MAX_SCALE),
+          tcx = (x0 + x1) / 2,
+          tcy = (y0 + y1) / 2;
+        // aproximación suave (el zoom en escala logarítmica)
+        const k = 0.15;
+        const ls = Math.log(view.scale),
+          nls = ls + (Math.log(tScale) - ls) * k;
+        const ncx = view.cx + (tcx - view.cx) * k,
+          ncy = view.cy + (tcy - view.cy) * k;
+        if (
+          Math.abs(nls - ls) > 1e-4 ||
+          Math.abs(ncx - view.cx) * view.scale > 0.05 ||
+          Math.abs(ncy - view.cy) * view.scale > 0.05
+        ) {
+          view.scale = Math.exp(nls);
+          view.cx = ncx;
+          view.cy = ncy;
+          dirty = true;
+        }
+      }
+
       (function loop() {
+        if (follow && args) followStep();
         if (dirty) {
           dirty = false;
           if (args) drawMap();
@@ -536,6 +743,8 @@
       });
       cv.addEventListener("pointermove", (e) => {
         if (!mapDrag) return;
+        if (follow && Math.hypot(e.clientX - mapDrag.x, e.clientY - mapDrag.y) > 3)
+          setFollow(false); // mover a mano desactiva el seguimiento
         view.cx = mapDrag.cx - (e.clientX - mapDrag.x) / view.scale;
         view.cy = mapDrag.cy - (e.clientY - mapDrag.y) / view.scale;
         dirty = true;
@@ -550,6 +759,7 @@
         "wheel",
         (e) => {
           e.preventDefault();
+          if (follow) setFollow(false);
           const r = cv.getBoundingClientRect(),
             mxp = e.clientX - r.left,
             myp = e.clientY - r.top;
@@ -697,13 +907,14 @@
           card.className = "card";
           card.style.borderLeftColor = r.color;
           const rows = {};
-          let html = `<h4 style="color:${r.color}">${r.name}</h4>`;
+          let html = `<h4 style="color:${r.color}">${r.name}</h4><div class="rows">`;
           const keys = [...Object.keys(r.metrics)];
           if (r.fase) keys.push("Fase");
           keys.forEach((k) => {
             const unit = k === "Fase" ? "" : r.metrics[k].unit;
             html += `<div class="row" data-k="${k}"><span>${k}</span><b data-unit="${unit}">—</b></div>`;
           });
+          html += `</div>`;
           card.innerHTML = html;
           card.querySelectorAll(".row").forEach((row) => {
             rows[row.dataset.k] = row;
