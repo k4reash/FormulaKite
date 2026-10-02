@@ -11,6 +11,22 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 
+CARTO_API_KEY = "cb1_47g1_1_e3de9d8bb58aa32a792ce32c"
+
+
+def carto_mapbox(**kwargs):
+    """Config `mapbox` de Plotly con el basemap oscuro de CARTO (requiere API key)."""
+    return dict(
+        style="white-bg",
+        layers=[dict(
+            below="traces",
+            sourcetype="raster",
+            source=[f"https://basemaps.cartocdn.com/dark_all/{{z}}/{{x}}/{{y}}.png?key={CARTO_API_KEY}"],
+        )],
+        **kwargs,
+    )
+
+
 _COMPONENTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "components")
 _time_range_selector_component = components.declare_component(
     "time_range_selector",
@@ -521,8 +537,7 @@ def build_map(dfs, color_by="Velocidad", view=None):
         center = dict(lat=float(all_lat.mean()), lon=float(all_lon.mean()))
         zoom = 12
     fig.update_layout(
-        mapbox=dict(
-            style="carto-darkmatter",
+        mapbox=carto_mapbox(
             center=center,
             zoom=zoom,
             uirevision="race_map",
@@ -944,8 +959,7 @@ def build_animated_map(dfs, step_s=15, duration_ms=700,
     all_lon = pd.concat([d["longitude"].dropna() for d in dfs if "longitude" in d.columns])
 
     fig.update_layout(
-        mapbox=dict(
-            style="carto-darkmatter",
+        mapbox=carto_mapbox(
             center=dict(lat=float(all_lat.mean()), lon=float(all_lon.mean())),
             zoom=12,
         ),
@@ -1105,8 +1119,7 @@ def _haversine_total(lats, lons) -> float:
     all_lon = pd.concat([d["longitude"].dropna() for d in dfs if "longitude" in d.columns])
 
     fig.update_layout(
-        mapbox=dict(
-            style="carto-darkmatter",
+        mapbox=carto_mapbox(
             center=dict(lat=float(all_lat.mean()), lon=float(all_lon.mean())),
             zoom=12,
         ),
