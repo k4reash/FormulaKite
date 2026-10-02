@@ -1,9 +1,11 @@
 """
 Formula Kite Analytics Dashboard
-Telemetría Sailmon · Python 3 · Streamlit
+Telemetría Sailmon Max / Vakaros Atlas · Python 3 · Streamlit
 """
 
+import io
 import os
+import struct
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -148,7 +150,10 @@ st.markdown(
 # ─── Constantes ──────────────────────────────────────────────────────────────
 MS_TO_KNOTS = 1.94384
 LOCAL_UTC_OFFSET = pd.Timedelta(hours=2)  # Sailmon exporta en UTC; se muestra en hora local UTC+2
-RECOVERY_KTS    = 15
+RECOVERY_FRAC   = 0.90  # recovery: hasta recuperar el 90 % de la SOG de entrada
+DROP_START_FRAC = 0.95  # la caída empieza cuando la SOG baja del 95 % de la de entrada
+ENTRY_WINDOW_S  = (15, 5)  # SOG de entrada: media entre 15 y 5 s antes del cambio de amura
+EXIT_WINDOW_S   = (20, 40)  # SOG de salida: mediana entre 20 y 40 s después (rumbo ya estable)
 FOIL_FLIGHT_KTS = 8   # por debajo de este umbral el foil no vuela (maniobra fallida / Caída)
 PHASE_SMOOTH_S  = 5   # ventana (s) de la mediana móvil aplicada a SOG y |TWA|
 PHASE_MIN_S     = 5   # un tramo más corto entre dos tramos de la misma fase se absorbe (parpadeo A-B-A)
@@ -159,6 +164,20 @@ MANEUVER_SIDE_MIN   = 0.25  # |media de sin(TWA)| mínima a cada lado (≈ TWA a
 MANEUVER_RATE_MIN   = 4     # °/s: la maniobra dura mientras el TWA gire más rápido que esto
 MANEUVER_MAX_EXT_S  = 10    # máx. segundos que se extiende la maniobra a cada lado del cruce
 MANEUVER_PAD_S      = 1     # segundos añadidos al principio y al final
+TWD_MAN_MIN_KTS      = 12    # TWD por maniobras (Atlas): en vuelo antes y después
+TWD_MAN_BEFORE_S     = 10    # s de rumbo estable antes de la maniobra (acaba 4 s antes del centro)
+TWD_MAN_AFTER_S      = 10    # s de rumbo estable después (empieza 3 s después del centro)
+TWD_MAN_DELAY_S      = 12    # s tras el centro en que se aplica la nueva TWD (como Sailmon)
+TWD_MAN_TURN_MIN     = 50    # ° de giro mínimo/máximo para que cuente como virada/trasluchada
+TWD_MAN_TURN_MAX     = 130
+TWD_MAN_MAX_SD       = 20    # ° de dispersión máxima del rumbo en cada ventana
+TWD_MAN_MAX_DEV      = 35    # ° máximos entre la bisectriz y la TWD vigente (si no, es arribada/orzada)
+TWD_REF_MIN_FLYING_S = 300   # s en vuelo mínimos para orientar las maniobras
+TWD_BORROW_TOL_S     = 60    # s máximos hasta el dato de Sailmon más cercano al copiar la TWD
+_TWD_HARMONICS = np.arange(1, 9)
+_TWD_AXES = np.radians(np.arange(0, 180, 1.0))
+DEVICE_LABELS = {"sailmon": "Sailmon Max", "atlas": "Vakaros Atlas"}
+WIND_SAILMON, WIND_ESTIMATE, WIND_MANUAL = "Sailmon de la sesión", "Por maniobras (como Sailmon)", "Manual"
 PHASE_COLORS = {
     "Popa":       "#EF553B",
     "Ceñida":     "#00CC96",
@@ -258,9 +277,24 @@ def classify_phases(sog_kts: pd.Series, twa: pd.Series) -> pd.Series:
     return run_id.map(dict(zip(runs.index, labels)))
 
 
-def load_csv(file, name: str) -> pd.DataFrame:
-    """Carga y preprocesa un CSV de Sailmon."""
-    df = pd.read_csv(file)
+def detect_device(filename: str, data: bytes):
+    """Devuelve "sailmon", "atlas" o None según la extensión y la cabecera del archivo."""
+    if filename.lower().endswith(".vkx"):
+        return "atlas"
+    header = data[:4096].decode("utf-8", errors="ignore").lstrip("﻿").splitlines()
+    if not header:
+        return None
+    cols = [c.strip().strip('"').lower() for c in header[0].split(",")]
+    if "timestamp" in cols and "sog_kts" in cols:
+        return "atlas"
+    if "time" in cols and any(c.startswith("sog") for c in cols):
+        return "sailmon"
+    return None
+
+
+def _read_sailmon(data: bytes) -> pd.DataFrame:
+    """Lee un CSV de Sailmon y normaliza sus nombres de columna al esquema interno."""
+    df = pd.read_csv(io.BytesIO(data))
     df.columns = df.columns.str.strip().str.replace('"', '')
 
     # ── Normalizar columnas Sailmon (nombre completo → nombre corto) ──────
@@ -288,6 +322,234 @@ def load_csv(file, name: str) -> pd.DataFrame:
                     break
     if rename:
         df.rename(columns=rename, inplace=True)
+    if "time" not in df.columns or "SOG" not in df.columns:
+        raise ValueError("no parece un export de Sailmon Max (faltan las columnas time / SOG)")
+    df["time"] = pd.to_datetime(df["time"], errors="coerce")
+    for col in ("COG", "HDT", "TWD"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+# Columnas del Atlas CSV → esquema interno (el mismo que Sailmon)
+ATLAS_CSV_MAP = {
+    "latitude": "latitude", "longitude": "longitude", "cog": "COG",
+    "hdg_true": "HDT", "heel": "Heel", "trim": "Trim Fore / Aft",
+}
+ATLAS_ANGLE_COLS = ("COG", "HDT", "Heel", "Trim Fore / Aft")
+
+# Tamaño del payload de cada tipo de fila VKX (https://github.com/vakaros/vkx, v1.4)
+VKX_ROW_SIZES = {
+    0xFF: 7, 0xFE: 2, 0x01: 32, 0x02: 44, 0x03: 20, 0x04: 13, 0x05: 17, 0x06: 18,
+    0x07: 12, 0x08: 13, 0x0A: 16, 0x0B: 16, 0x0C: 12, 0x0E: 16, 0x0F: 16, 0x10: 12,
+    0x20: 13, 0x21: 52,
+}
+VKX_PVO = struct.Struct("<Qiifffffff")  # 0x02 Posición, velocidad y orientación
+
+
+def _read_atlas_csv(data: bytes) -> pd.DataFrame:
+    """Lee un CSV del Vakaros Atlas (2 Hz) al esquema interno, SOG en m/s y hora UTC."""
+    raw = pd.read_csv(io.BytesIO(data))
+    raw.columns = raw.columns.str.strip().str.replace('"', '')
+    if "timestamp" not in raw.columns or "sog_kts" not in raw.columns:
+        raise ValueError("no parece un CSV del Vakaros Atlas (faltan las columnas timestamp / sog_kts)")
+    df = raw[[c for c in ATLAS_CSV_MAP if c in raw.columns]].rename(columns=ATLAS_CSV_MAP)
+    df["time"] = pd.to_datetime(raw["timestamp"], errors="coerce", utc=True).dt.tz_localize(None)
+    df["SOG"] = pd.to_numeric(raw["sog_kts"], errors="coerce") / MS_TO_KNOTS
+    return df
+
+
+def _read_vkx(data: bytes) -> pd.DataFrame:
+    """Lee un .vkx del Vakaros Atlas (2 Hz) al esquema interno. Rumbo, escora y trimado se
+    obtienen del cuaternión (marco NED verdadero) como ángulos de Euler ZYX, igual que el CSV."""
+    rows, i = [], 0
+    while i < len(data):
+        key = data[i]
+        size = VKX_ROW_SIZES.get(key)
+        if size is None:
+            raise ValueError(f"tipo de fila VKX desconocido 0x{key:02X} en el byte {i}")
+        if key == 0x02 and i + 1 + size <= len(data):
+            rows.append(VKX_PVO.unpack_from(data, i + 1))
+        i += 1 + size
+    if not rows:
+        raise ValueError("el .vkx no contiene datos de posición")
+    a = np.array(rows, dtype=float)
+    w, x, y, z = a[:, 6], a[:, 7], a[:, 8], a[:, 9]
+    return pd.DataFrame({
+        "time":      pd.to_datetime(a[:, 0].astype("int64"), unit="ms"),
+        "latitude":  a[:, 1] * 1e-7,
+        "longitude": a[:, 2] * 1e-7,
+        "SOG":       a[:, 3],
+        "COG":       np.degrees(a[:, 4]) % 360,
+        "HDT":       np.degrees(np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))) % 360,
+        "Heel":      np.degrees(np.arctan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y))),
+        "Trim Fore / Aft": np.degrees(np.arcsin(np.clip(2 * (w * y - z * x), -1, 1))),
+    })
+
+
+def _to_1hz(df: pd.DataFrame) -> pd.DataFrame:
+    """Remuestrea a 1 Hz (todas las ventanas de la app cuentan muestras como segundos).
+    Media aritmética para posición/velocidad y media circular para los ángulos."""
+    d = df.dropna(subset=["time"]).set_index("time").sort_index()
+    out = d[[c for c in d.columns if c not in ATLAS_ANGLE_COLS]].resample("1s").mean()
+    for col in ATLAS_ANGLE_COLS:
+        if col in d.columns:
+            rad = np.radians(d[col])
+            ang = np.degrees(np.arctan2(np.sin(rad).resample("1s").mean(),
+                                        np.cos(rad).resample("1s").mean()))
+            out[col] = ang % 360 if col in ("COG", "HDT") else ang
+    return out.dropna(subset=["latitude", "longitude", "SOG"]).reset_index()
+
+
+@st.cache_data(show_spinner=False)
+def _read_atlas_raw(data: bytes, filename: str) -> pd.DataFrame:
+    """Muestras originales (2 Hz) del Atlas, desde CSV o .vkx."""
+    return _read_vkx(data) if filename.lower().endswith(".vkx") else _read_atlas_csv(data)
+
+
+@st.cache_data(show_spinner=False)
+def load_track(data: bytes, filename: str, device: str) -> pd.DataFrame:
+    """Lee un archivo de cualquier dispositivo al esquema interno (hora UTC, SOG en m/s, 1 Hz)."""
+    if device == "atlas":
+        df = _to_1hz(_read_atlas_raw(data, filename))
+    elif filename.lower().endswith(".vkx"):
+        raise ValueError("un .vkx solo puede ser del Vakaros Atlas")
+    else:
+        df = _read_sailmon(data)
+    df["Dispositivo"] = DEVICE_LABELS[device]
+    return df
+
+
+def _wrap180(deg):
+    return (deg + 180) % 360 - 180
+
+
+def wind_from_twd(twd, cog, sog):
+    """Mismas fórmulas que Sailmon: TWA = TWD − COG (±180°) y VMG = SOG·cos(TWA)."""
+    twa = _wrap180(twd - cog)
+    return twa, sog * np.cos(np.radians(twa))
+
+
+def apply_wind(df: pd.DataFrame, twd) -> pd.DataFrame:
+    """Añade TWD, TWA y VMG (m/s) a un track sin viento a partir de una TWD (serie o constante)."""
+    df = df.copy()
+    df["TWD"] = twd
+    df["TWA"], df["VMG"] = wind_from_twd(df["TWD"], df["COG"], df["SOG"])
+    return df
+
+
+def _symmetry_axis(cog_rad: np.ndarray) -> float:
+    """Eje (0–180°, en rad) respecto al que la distribución de rumbos es más simétrica: los
+    bordos de ceñida y popa en ambas amuras se reflejan en la línea del viento."""
+    C = np.cos(np.outer(_TWD_HARMONICS, cog_rad)).mean(axis=1)
+    S = np.sin(np.outer(_TWD_HARMONICS, cog_rad)).mean(axis=1)
+    a = 2 * np.outer(_TWD_AXES, _TWD_HARMONICS)
+    score = ((C * C - S * S) * np.cos(a) + 2 * C * S * np.sin(a)).sum(axis=1)
+    return float(_TWD_AXES[np.argmax(score)])
+
+
+def _twd_reference(df: pd.DataFrame):
+    """TWD aproximada de toda la sesión, solo para orientar cada maniobra (virada o trasluchada).
+    Eje: el de máxima simetría de los COG en vuelo. Sentido: barlovento es el lado con menor
+    SOG media (en FK se va más rápido a popa). None si no hay datos suficientes."""
+    sog_kts = df["SOG"] * MS_TO_KNOTS
+    fl = df[(sog_kts >= TWD_MAN_MIN_KTS) & df["COG"].notna()]
+    if len(fl) < TWD_REF_MIN_FLYING_S:
+        return None
+    cog = np.radians(fl["COG"].to_numpy(dtype=float))
+    sog = fl["SOG"].to_numpy(dtype=float)
+    axis = _symmetry_axis(cog)
+    candidates = []
+    for d in (axis, axis + np.pi):
+        up = np.cos(d - cog) > 0  # |TWA| < 90°
+        if up.any() and (~up).any():
+            candidates.append((sog[up].mean() - sog[~up].mean(), d))
+    return np.degrees(min(candidates)[1]) % 360 if candidates else None
+
+
+def _window_stats(series: pd.Series, n: int, end: int) -> pd.Series:
+    """Media de la ventana de n muestras que termina `end` muestras después de cada posición."""
+    return series.rolling(n).mean().shift(-end)
+
+
+@st.cache_data(show_spinner=False)
+def estimate_twd(df: pd.DataFrame):
+    """
+    TWD por maniobras, como Sailmon: en cada virada/trasluchada la TWD es la bisectriz del COG
+    medio antes y después (+180° si es trasluchada) y se aplica TWD_MAN_DELAY_S después del
+    cambio de amura. Antes de la primera maniobra no hay viento.
+    Solo cuentan maniobras limpias: en vuelo a ambos lados, rumbo estable antes y después,
+    giro entre TWD_MAN_TURN_MIN y TWD_MAN_TURN_MAX y bisectriz a menos de TWD_MAN_MAX_DEV de la
+    TWD vigente (descarta arribadas/orzadas en boya, cuya bisectriz es perpendicular al viento).
+    Devuelve (serie de TWD alineada con df, nº de maniobras usadas, TWD de referencia).
+    """
+    ref = _twd_reference(df)
+    if ref is None:
+        return None, 0, None
+    d = df.reset_index(drop=True)
+    rad = np.radians(d["COG"].astype(float))
+    sin, cos, kts = np.sin(rad), np.cos(rad), d["SOG"] * MS_TO_KNOTS
+    nb, na = TWD_MAN_BEFORE_S, TWD_MAN_AFTER_S
+    # Ventana "antes": [i-3-nb, i-4]; ventana "después": [i+3, i+2+na]
+    sb, cb = _window_stats(sin, nb, -4), _window_stats(cos, nb, -4)
+    sa, ca = _window_stats(sin, na, 2 + na), _window_stats(cos, na, 2 + na)
+    before = np.degrees(np.arctan2(sb, cb))
+    after = np.degrees(np.arctan2(sa, ca))
+    sd_b = np.degrees(np.sqrt(-2 * np.log(np.hypot(sb, cb).clip(1e-9, 1))))
+    sd_a = np.degrees(np.sqrt(-2 * np.log(np.hypot(sa, ca).clip(1e-9, 1))))
+    turn = _wrap180(after - before).abs()
+    span = (d["time"].shift(-(2 + na)) - d["time"].shift(3 + nb)).dt.total_seconds()
+    ok = (
+        turn.between(TWD_MAN_TURN_MIN, TWD_MAN_TURN_MAX)
+        & (sd_b <= TWD_MAN_MAX_SD) & (sd_a <= TWD_MAN_MAX_SD)
+        & (_window_stats(kts, nb, -4) >= TWD_MAN_MIN_KTS)
+        & (_window_stats(kts, na, 2 + na) >= TWD_MAN_MIN_KTS)
+        & (span <= 5 + nb + na + 2)  # sin huecos grandes en el registro
+    ).to_numpy()
+
+    twd = np.full(len(d), np.nan)
+    idx = np.flatnonzero(ok)
+    n_man, last = 0, ref
+    for group in np.split(idx, np.flatnonzero(np.diff(idx) > 10) + 1) if len(idx) else []:
+        i = group[np.argmax(turn.to_numpy()[group])]  # centro de la maniobra: giro máximo
+        bis = np.degrees(np.arctan2(sb[i] + sa[i], cb[i] + ca[i])) % 360
+        if abs(_wrap180(bis - last)) > 90:  # trasluchada: la bisectriz apunta a sotavento
+            bis = (bis + 180) % 360
+        if abs(_wrap180(bis - last)) > TWD_MAN_MAX_DEV:  # arribada/orzada: no cruza el viento
+            continue
+        twd[min(i + TWD_MAN_DELAY_S, len(d) - 1)] = last = bis
+        n_man += 1
+    if not n_man:
+        return None, 0, ref
+    return pd.Series(twd, index=df.index).ffill(), n_man, ref
+
+
+def borrow_twd(df: pd.DataFrame, sailmon_dfs) -> pd.Series:
+    """TWD de los Sailmon de la sesión interpolada a los tiempos de df (NaN si no hay dato
+    de Sailmon a menos de TWD_BORROW_TOL_S)."""
+    src = pd.concat(
+        [d[["time", "TWD"]] for d in sailmon_dfs if "TWD" in d.columns], ignore_index=True
+    ).dropna()
+    if src.empty:
+        return pd.Series(np.nan, index=df.index)
+    rad = np.radians(src["TWD"].to_numpy(dtype=float))
+    src = (
+        pd.DataFrame({"sin": np.sin(rad), "cos": np.cos(rad)}, index=src["time"].dt.floor("1s"))
+        .groupby(level=0).median()
+    )
+    epoch = pd.Timestamp(0)
+    t_src = (src.index - epoch).total_seconds().to_numpy()
+    t_dst = (df["time"] - epoch).dt.total_seconds().to_numpy()
+    twd = np.degrees(np.arctan2(np.interp(t_dst, t_src, src["sin"]),
+                                np.interp(t_dst, t_src, src["cos"]))) % 360
+    nearest = np.searchsorted(t_src, t_dst).clip(1, len(t_src) - 1)
+    gap = np.minimum(np.abs(t_dst - t_src[nearest - 1]), np.abs(t_dst - t_src[nearest]))
+    return pd.Series(np.where(gap <= TWD_BORROW_TOL_S, twd, np.nan), index=df.index)
+
+
+def finalize_track(df: pd.DataFrame, name: str) -> pd.DataFrame:
+    """Preprocesado común a todos los dispositivos: nudos, fases, hora local y regatista."""
+    df = df.copy()
 
     # Convertir m/s → nudos
     for col in ("SOG", "VMG"):
@@ -305,11 +567,9 @@ def load_csv(file, name: str) -> pd.DataFrame:
         twa_col = df["TWA"] if "TWA" in df.columns else pd.Series(np.nan, index=df.index)
         df["Fase"] = classify_phases(df["SOG_kts"], twa_col)
 
-    # Parsear tiempo (CSV en UTC → convertir a hora local UTC+2)
+    # Tiempo en UTC → hora local UTC+2
     if "time" in df.columns:
-        df["time"] = (
-            pd.to_datetime(df["time"], errors="coerce") + LOCAL_UTC_OFFSET
-        )
+        df["time"] = df["time"] + LOCAL_UTC_OFFSET
 
     df["Regatista"] = name
     return df
@@ -336,10 +596,13 @@ def detect_maneuvers(df: pd.DataFrame) -> pd.DataFrame:
     """
     Detecta viradas y trasluchadas por cambio de signo en TWA.
     Para cada maniobra calcula:
-      - SOG antes (media 5s previos)
+      - SOG antes: media entre ENTRY_WINDOW_S s antes del cambio de amura (antes de frenar)
       - SOG mínima (ventana ±15s)
       - Caída de SOG
-      - Recovery time (segundos hasta volver a >= 15 kts)
+      - Recovery time: segundos desde que la SOG empieza a caer (< DROP_START_FRAC de la de
+        entrada) hasta recuperar RECOVERY_FRAC de la velocidad de referencia: la menor entre la
+        de entrada y la de salida (una trasluchada en la boya de sotavento que sale a ceñida no
+        puede recuperar la velocidad de popa)
     """
     if "TWA" not in df.columns or "SOG_kts" not in df.columns:
         return pd.DataFrame()
@@ -355,8 +618,13 @@ def detect_maneuvers(df: pd.DataFrame) -> pd.DataFrame:
     while i < len(twa) - 1:
         prev, curr = twa[i - 1], twa[i]
         if not (np.isnan(prev) or np.isnan(curr)) and prev * curr < 0:
-            # SOG antes de la maniobra (media 5s previos)
-            sog_before = float(np.nanmean(sog[max(0, i - 5):i]))
+            # SOG de entrada, antes de empezar a frenar
+            e0, e1 = ENTRY_WINDOW_S
+            entry = sog[max(0, i - e0):max(0, i - e1)]
+            if not np.isfinite(entry).any():
+                i += 1
+                continue
+            sog_before = float(np.nanmean(entry))
 
             # Descartar si el foil no estaba volando antes de la maniobra
             if sog_before < FOIL_FLIGHT_KTS:
@@ -372,11 +640,20 @@ def detect_maneuvers(df: pd.DataFrame) -> pd.DataFrame:
             avg_abs = float(np.nanmean(np.abs(twa[max(0, i - 5):i])))
             mtype = "Virada" if avg_abs <= 90 else "Trasluchada"
 
-            # Recovery time: segundos desde min_sog hasta SOG >= RECOVERY_KTS
+            # Recovery time: desde el inicio de la caída hasta recuperar la velocidad de entrada
+            drop_start = min_idx
+            while drop_start > max(0, i - 25) and sog[drop_start - 1] < DROP_START_FRAC * sog_before:
+                drop_start -= 1
+            x0, x1 = EXIT_WINDOW_S
+            exit_win = sog[i + x0:i + x1]
+            target = sog_before
+            exit_sog = float(np.nanmedian(exit_win)) if np.isfinite(exit_win).any() else np.nan
+            if exit_sog >= FOIL_FLIGHT_KTS:  # si sale sin volar (caída), se mide contra la entrada
+                target = min(sog_before, exit_sog)
             rec = ">90"
             for j in range(min_idx, min(len(sog), min_idx + 90)):
-                if sog[j] >= RECOVERY_KTS:
-                    rec = j - min_idx
+                if sog[j] >= RECOVERY_FRAC * target:
+                    rec = j - drop_start
                     break
 
             row = {
@@ -1258,20 +1535,32 @@ with st.sidebar:
     st.divider()
 
     uploaded_files = st.file_uploader(
-        "Archivos CSV (Sailmon)",
-        type=["csv"],
+        "Archivos (Sailmon Max CSV · Vakaros Atlas CSV/VKX)",
+        type=["csv", "vkx"],
         accept_multiple_files=True,
-        help="Un archivo .csv por regatista. Frecuencia esperada: 1 Hz.",
+        help="Un archivo por regatista. El dispositivo se detecta automáticamente.",
     )
 
-    racer_names = []
+    racer_names, racer_devices = [], []
+    wind_box = None
     if uploaded_files:
         st.divider()
-        st.subheader("Nombres de Regatistas")
+        st.subheader("Regatistas")
         for i, f in enumerate(uploaded_files):
-            default = f.name.replace(".csv", "").replace("_", " ").title()
+            default = os.path.splitext(f.name)[0].replace("_", " ").title()
             name = st.text_input(f"Regatista {i + 1}", value=default, key=f"n{i}")
+            detected = detect_device(f.name, f.getvalue())
+            choice = st.selectbox(
+                "Dispositivo", ["Auto", *DEVICE_LABELS.values()], key=f"dev{i}",
+            )
+            if choice == "Auto":
+                st.caption(f"Detectado: **{DEVICE_LABELS.get(detected, 'desconocido')}**")
+                device = detected
+            else:
+                device = next(k for k, v in DEVICE_LABELS.items() if v == choice)
             racer_names.append(name)
+            racer_devices.append(device)
+        wind_box = st.container()
 
         if st.session_state.get("trim_confirmed_for"):
             if st.button("🔁 Cambiar tramo seleccionado"):
@@ -1296,39 +1585,81 @@ if not uploaded_files:
     st.title("🪁 Formula Kite Analytics")
     st.markdown(
         """
-        Analiza y compara la telemetría de regatistas de **Formula Kite** con datos de **Sailmon**.
+        Analiza y compara la telemetría de regatistas de **Formula Kite** con datos de
+        **Sailmon Max** y **Vakaros Atlas**.
 
-        **← Carga uno o más archivos CSV** desde el panel lateral para comenzar.
+        **← Carga uno o más archivos** desde el panel lateral para comenzar. El dispositivo
+        se detecta automáticamente (también se puede elegir a mano).
 
         ---
 
-        ### Columnas esperadas en el CSV
+        ### Formatos admitidos
 
-        | Columna | Descripción | Unidad de entrada |
-        |---------|-------------|-------------------|
-        | `time` | Timestamp de la muestra | ISO 8601 / UTC |
-        | `latitude` / `longitude` | Posición GPS | grados decimales |
-        | `SOG` | Speed Over Ground | **m/s** (se convierte a kts) |
-        | `VMG` | Velocity Made Good | **m/s** (se convierte a kts) |
-        | `TWA` | True Wind Angle | grados (± babor/estribor) |
-        | `HDT` | Heading True | grados |
+        | Dispositivo | Archivo | Frecuencia | Viento |
+        |-------------|---------|------------|--------|
+        | Sailmon Max | export `.csv` (`time`, `SOG`, `COG`, `TWA`, `TWD`, `VMG`…) | 1 Hz | incluido |
+        | Vakaros Atlas | export `.csv` (`timestamp`, `sog_kts`, `cog`, `hdg_true`, `heel`, `trim`) o binario `.vkx` | 2 Hz → se remuestrea a 1 Hz | calculado |
 
-        > Los datos de Sailmon tienen frecuencia de muestreo de **1 Hz** (1 fila/segundo).
+        > El Atlas no registra viento. Su **TWD** se copia de un Sailmon de la misma sesión,
+        > se calcula **por maniobras como Sailmon** (bisectriz del rumbo antes y después de cada
+        > virada/trasluchada) o se introduce a mano. **TWA** y **VMG** usan las mismas fórmulas
+        > que Sailmon: TWA = TWD − COG y VMG = SOG · cos(TWA).
         """
     )
     st.stop()
 
 
 # ─── Carga de datos ───────────────────────────────────────────────────────────
-dfs_full = []
-files_full = []  # archivo original de cada df en dfs_full (para exportar el recorte)
-for f, nm in zip(uploaded_files, racer_names):
+tracks = []  # (índice, archivo, nombre, dispositivo, df en esquema interno)
+for i, (f, nm, dev) in enumerate(zip(uploaded_files, racer_names, racer_devices)):
     with st.spinner(f"Procesando {f.name}…"):
         try:
-            dfs_full.append(load_csv(f, nm))
-            files_full.append(f)
+            if dev is None:
+                raise ValueError("formato no reconocido; elige el dispositivo en el panel lateral")
+            tracks.append((i, f, nm, dev, load_track(f.getvalue(), f.name, dev)))
         except Exception as exc:
             st.error(f"❌ Error al cargar **{f.name}**: {exc}")
+
+# Viento de los Atlas: copiado de Sailmon, por maniobras (como Sailmon) o manual
+_sailmon_raw = [df for _, _, _, dev, df in tracks if dev == "sailmon"]
+if any(dev == "atlas" for _, _, _, dev, _ in tracks):
+    with wind_box:
+        st.divider()
+        st.subheader("Viento · Vakaros Atlas")
+        for k, (i, f, nm, dev, df) in enumerate(tracks):
+            if dev != "atlas":
+                continue
+            options = ([WIND_SAILMON] if _sailmon_raw else []) + [WIND_ESTIMATE, WIND_MANUAL]
+            src = st.selectbox(f"Origen del viento · {nm}", options, key=f"wind_src{i}")
+            twd_man, n_man, twd_ref = estimate_twd(df)
+            if src == WIND_SAILMON:
+                twd = borrow_twd(df, _sailmon_raw)
+                st.caption(f"TWD de Sailmon en el {twd.notna().mean():.0%} del track.")
+            elif src == WIND_ESTIMATE:
+                twd = twd_man
+                if twd is not None:
+                    st.caption(
+                        f"TWD de **{n_man}** maniobras · mediana **{twd.median():.0f}°** "
+                        f"(rango {twd.quantile(0.05):.0f}–{twd.quantile(0.95):.0f}°). "
+                        "Sin viento hasta la primera maniobra."
+                    )
+            else:
+                _default = twd_man.median() if twd_man is not None else twd_ref
+                twd = st.number_input(
+                    "TWD (°)", min_value=0.0, max_value=359.0, step=1.0,
+                    value=float(round(_default)) if _default is not None else 0.0,
+                    key=f"wind_twd{i}",
+                )
+            if twd is None or (isinstance(twd, pd.Series) and twd.isna().all()):
+                st.info("Sin viento: las fases solo distinguen En vuelo / Caída, sin maniobras ni polares.")
+            else:
+                tracks[k] = (i, f, nm, dev, apply_wind(df, twd))
+
+dfs_full = []
+files_full = []  # archivo original de cada df en dfs_full (para exportar el recorte)
+for _, f, nm, dev, df in tracks:
+    dfs_full.append(finalize_track(df, nm))
+    files_full.append(f)
 
 if not dfs_full:
     st.warning("No se pudieron cargar archivos válidos.")
@@ -1494,28 +1825,43 @@ if not dfs:
     st.warning("No hay datos en el tramo seleccionado.")
     st.stop()
 
+def _vkx_as_atlas_csv(data: bytes) -> pd.DataFrame:
+    """Muestras de un .vkx con las columnas del CSV del Atlas (el binario no se puede recortar)."""
+    raw = _read_atlas_raw(data, "track.vkx")
+    out = raw.rename(columns={v: k for k, v in ATLAS_CSV_MAP.items()})
+    out.insert(0, "timestamp", raw["time"].dt.strftime("%Y-%m-%dT%H:%M:%S.%f").str[:-3] + "+0000")
+    out.insert(3, "sog_kts", (raw["SOG"] * MS_TO_KNOTS).round(3))
+    return out[["timestamp", "latitude", "longitude", "sog_kts", "cog", "hdg_true", "heel", "trim"]]
+
+
 def _raw_trimmed_csv(file, trim_range) -> bytes:
-    """Filas del CSV original de Sailmon (mismas columnas, hora en UTC) dentro del tramo,
-    para que el recorte se pueda volver a subir como un export normal."""
-    file.seek(0)
-    raw = pd.read_csv(file)
+    """Filas del archivo original (mismas columnas, hora en UTC) dentro del tramo, para que
+    el recorte se pueda volver a subir como un export normal. Un .vkx sale como CSV del Atlas."""
+    data = file.getvalue()
+    if file.name.lower().endswith(".vkx"):
+        raw = _vkx_as_atlas_csv(data)
+    else:
+        raw = pd.read_csv(io.BytesIO(data))
     if trim_range:
-        time_col = next(c for c in raw.columns if c.strip().replace('"', "") == "time")
-        local_t = pd.to_datetime(raw[time_col], errors="coerce") + LOCAL_UTC_OFFSET
-        raw = raw[local_t.between(*trim_range)]
+        time_col = next(c for c in raw.columns if c.strip().replace('"', "") in ("time", "timestamp"))
+        utc_t = pd.to_datetime(raw[time_col], errors="coerce", utc=True).dt.tz_localize(None)
+        raw = raw[(utc_t + LOCAL_UTC_OFFSET).between(*trim_range)]
     return raw.to_csv(index=False).encode("utf-8")
 
 
 with st.expander("⬇️ Descargar CSV recortado por regatista"):
-    st.caption("Mismo formato que el export de Sailmon: puedes volver a subirlo a la app tal cual.")
-    for f_dl, df_dl in zip(files_full, dfs_full):
+    st.caption(
+        "Mismo formato que el export original (los .vkx se descargan como CSV del Atlas): "
+        "puedes volver a subirlo a la app tal cual."
+    )
+    for _dl_i, (f_dl, df_dl) in enumerate(zip(files_full, dfs_full)):
         _dl_name = df_dl["Regatista"].iloc[0]
         st.download_button(
             f"Descargar {_dl_name}_recortado.csv",
             data=_raw_trimmed_csv(f_dl, _trim_range),
             file_name=f"{_dl_name}_recortado.csv",
             mime="text/csv",
-            key=f"dl_{_dl_name}",
+            key=f"dl_{_dl_i}",
         )
 
 st.divider()
@@ -1795,7 +2141,8 @@ for df in dfs:
             "SOG antes (kts)": st.column_config.NumberColumn(
                 "SOG antes (kts)",
                 format="%.1f kts",
-                help="Velocidad media (SOG) en los 5 segundos previos al inicio de la maniobra.",
+                help="Velocidad de entrada: SOG media entre 15 y 5 segundos antes del cambio de amura, "
+                     "antes de empezar a frenar.",
             ),
             "SOG mín (kts)": st.column_config.NumberColumn(
                 "SOG mín (kts)",
@@ -1809,8 +2156,10 @@ for df in dfs:
             ),
             "Recovery (s)": st.column_config.TextColumn(
                 "Recovery (s)",
-                help="⏱️ **Tiempo de recuperación:** segundos que transcurren desde la velocidad mínima "
-                     "hasta que el regatista vuelve a superar los 15 nudos. "
+                help="⏱️ **Tiempo de recuperación:** segundos desde que la velocidad empieza a caer "
+                     "(por debajo del 95 % de la SOG de entrada) hasta recuperar el 90 % de la SOG "
+                     "de entrada, o de la de salida si es menor (p. ej. trasluchada en boya que sale "
+                     "a ceñida). "
                      "Un recovery bajo indica una maniobra más limpia y rápida.",
             ),
         }
