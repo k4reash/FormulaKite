@@ -17,7 +17,7 @@ CARTO_API_KEY = os.environ.get("CARTO_API_KEY", "cb1_47g1_1_e3de9d8bb58aa32a792c
 
 
 def carto_mapbox(**kwargs):
-    """Config `mapbox` de Plotly con el basemap oscuro de CARTO (requiere API key)."""
+    """Config `map` (MapLibre) de Plotly con el basemap oscuro de CARTO (requiere API key)."""
     return dict(
         style="white-bg",
         layers=[dict(
@@ -742,7 +742,7 @@ def build_map(dfs, color_by="Velocidad", view=None):
                                     fase.values, hora.values, heel.values])
 
         if color_by == "Velocidad" and "SOG_kts" in df.columns:
-            fig.add_trace(go.Scattermapbox(
+            fig.add_trace(go.Scattermap(
                 lat=df["latitude"], lon=df["longitude"], mode="markers",
                 marker=dict(
                     size=5,
@@ -767,7 +767,7 @@ def build_map(dfs, color_by="Velocidad", view=None):
             ))
         elif color_by == "Heel" and "Heel" in df.columns:
             _heel_max = float(df["Heel"].abs().quantile(0.99)) or 1.0
-            fig.add_trace(go.Scattermapbox(
+            fig.add_trace(go.Scattermap(
                 lat=df["latitude"], lon=df["longitude"], mode="markers",
                 marker=dict(
                     size=5,
@@ -796,7 +796,7 @@ def build_map(dfs, color_by="Velocidad", view=None):
                 sub = df[df["Fase"] == fase]
                 if sub.empty:
                     continue
-                fig.add_trace(go.Scattermapbox(
+                fig.add_trace(go.Scattermap(
                     lat=sub["latitude"], lon=sub["longitude"], mode="markers",
                     marker=dict(size=5, color=col),
                     name=f"{name} – {fase}",
@@ -811,7 +811,7 @@ def build_map(dfs, color_by="Velocidad", view=None):
                     ),
                 ))
         else:
-            fig.add_trace(go.Scattermapbox(
+            fig.add_trace(go.Scattermap(
                 lat=df["latitude"], lon=df["longitude"], mode="markers",
                 marker=dict(size=5, color=color), name=name,
                 customdata=_build_customdata(df),
@@ -834,7 +834,7 @@ def build_map(dfs, color_by="Velocidad", view=None):
         center = dict(lat=float(all_lat.mean()), lon=float(all_lon.mean()))
         zoom = 12
     fig.update_layout(
-        mapbox=carto_mapbox(
+        map=carto_mapbox(
             center=center,
             zoom=zoom,
             uirevision="race_map",
@@ -1194,7 +1194,7 @@ def build_animated_map(dfs, step_s=15, duration_ms=700,
         name  = df["Regatista"].iloc[0]
         lats, lons, sogs = _trail_slices(idx, t0)
         blat, blon       = _boat_pos(idx, t0)
-        initial_data.append(go.Scattermapbox(
+        initial_data.append(go.Scattermap(
             lat=lats, lon=lons,
             mode="lines+markers",
             line=dict(color=color, width=2),
@@ -1204,7 +1204,7 @@ def build_animated_map(dfs, step_s=15, duration_ms=700,
             opacity=0.9,
             name=name, legendgroup=name, showlegend=True,
         ))
-        initial_data.append(go.Scattermapbox(
+        initial_data.append(go.Scattermap(
             lat=blat, lon=blon,
             mode="markers",
             marker=dict(size=14, color=color, opacity=1),
@@ -1223,7 +1223,7 @@ def build_animated_map(dfs, step_s=15, duration_ms=700,
             lats, lons, sogs = _trail_slices(idx, t)
             blat, blon       = _boat_pos(idx, t)
             # Trail — sin props de leyenda para que Plotly preserve las iniciales
-            frame_data.append(go.Scattermapbox(
+            frame_data.append(go.Scattermap(
                 lat=lats, lon=lons,
                 mode="lines+markers",
                 line=dict(color=color, width=2),
@@ -1233,7 +1233,7 @@ def build_animated_map(dfs, step_s=15, duration_ms=700,
                 opacity=0.9,
             ))
             # Barco — dot grande
-            frame_data.append(go.Scattermapbox(
+            frame_data.append(go.Scattermap(
                 lat=blat, lon=blon,
                 mode="markers",
                 marker=dict(size=14, color=color, opacity=1),
@@ -1256,7 +1256,7 @@ def build_animated_map(dfs, step_s=15, duration_ms=700,
     all_lon = pd.concat([d["longitude"].dropna() for d in dfs if "longitude" in d.columns])
 
     fig.update_layout(
-        mapbox=carto_mapbox(
+        map=carto_mapbox(
             center=dict(lat=float(all_lat.mean()), lon=float(all_lon.mean())),
             zoom=12,
         ),
@@ -1359,7 +1359,7 @@ def _haversine_total(lats, lons) -> float:
             trail = df_s.iloc[lo:hi]
 
             # Trail (ventana temporal)
-            tr = go.Scattermapbox(
+            tr = go.Scattermap(
                 lat=trail["latitude"].tolist(),
                 lon=trail["longitude"].tolist(),
                 mode="lines",
@@ -1376,7 +1376,7 @@ def _haversine_total(lats, lons) -> float:
             row = positions[idx].loc[t]
             lat_, lon_ = row["latitude"], row["longitude"]
             ok = not (pd.isna(lat_) or pd.isna(lon_))
-            bt = go.Scattermapbox(
+            bt = go.Scattermap(
                 lat=[float(lat_)] if ok else [None],
                 lon=[float(lon_)] if ok else [None],
                 mode="markers+text",
@@ -1416,7 +1416,7 @@ def _haversine_total(lats, lons) -> float:
     all_lon = pd.concat([d["longitude"].dropna() for d in dfs if "longitude" in d.columns])
 
     fig.update_layout(
-        mapbox=carto_mapbox(
+        map=carto_mapbox(
             center=dict(lat=float(all_lat.mean()), lon=float(all_lon.mean())),
             zoom=12,
         ),
