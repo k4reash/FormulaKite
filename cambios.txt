@@ -1,0 +1,9 @@
+-El TWD debe ser el mismo para todos los csv cargados ya que si no los datos no son coherentes.
+-Los datos a mostrar cambiar % vuelo por VMG medio.
+La parte de polares y consistencia por fases ponlas al final.
+En la tabla de bordes, las maniobras  donde las estas contando? chequear si las omite del calculo.
+En las maniobras, crear un mapa interactivo los metros que pierde en la maniobra respecto a un ghost que continua recto sin maniobrar, igual que se hace en el mapa de track
+Crear apartado para comparar legs al cambiar de material (la hora sera distinta en cada track)
+Añadir opcion de visualizar video a la vez que el track
+
+Ver donde desplegar la app con password

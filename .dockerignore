@@ -1,0 +1,11 @@
+.git
+.gitignore
+.devcontainer
+__pycache__
+*.pyc
+*.csv
+Analisis/
+cambios.txt
+conexto.md
+Dockerfile
+.dockerignore

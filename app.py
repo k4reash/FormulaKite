@@ -13,7 +13,7 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 
-CARTO_API_KEY = "cb1_47g1_1_e3de9d8bb58aa32a792ce32c"
+CARTO_API_KEY = os.environ.get("CARTO_API_KEY", "cb1_47g1_1_e3de9d8bb58aa32a792ce32c")
 
 
 def carto_mapbox(**kwargs):
@@ -182,7 +182,6 @@ TWD_BORROW_TOL_S     = 60    # s máximos hasta el dato de Sailmon más cercano 
 _TWD_HARMONICS = np.arange(1, 9)
 _TWD_AXES = np.radians(np.arange(0, 180, 1.0))
 DEVICE_LABELS = {"sailmon": "Sailmon Max", "atlas": "Vakaros Atlas"}
-WIND_SAILMON, WIND_ESTIMATE, WIND_MANUAL = "Sailmon de la sesión", "Por maniobras (como Sailmon)", "Manual"
 PHASE_COLORS = {
     "Popa":       "#EF553B",
     "Ceñida":     "#00CC96",
@@ -582,14 +581,22 @@ def finalize_track(df: pd.DataFrame, name: str) -> pd.DataFrame:
 
 def compute_kpis(df: pd.DataFrame) -> dict:
     k = {}
-    if "SOG_kts" in df.columns:
-        k["sog_max"]  = df["SOG_kts"].max()
-        k["sog_mean"] = df["SOG_kts"].mean()
-    if "VMG_kts" in df.columns:
-        k["vmg_max"] = df["VMG_kts"].max()
+    # Velocidades y VMG solo en navegación limpia: sin maniobras (Transición) ni
+    # caídas. Sin dato de viento todo el vuelo es Transición, así que entonces
+    # solo se descartan las caídas.
+    nav = df
+    if "Fase" in df.columns:
+        has_wind = "TWA" in df.columns and df["TWA"].notna().any()
+        nav = df[df["Fase"].isin(["Popa", "Ceñida", "Través"])] if has_wind else df[df["Fase"] != "Caída"]
+    if "SOG_kts" in nav.columns:
+        k["sog_max"]  = nav["SOG_kts"].max()
+        k["sog_mean"] = nav["SOG_kts"].mean()
+    if "VMG_kts" in nav.columns:
+        k["vmg_max"] = nav["VMG_kts"].max()
+        # VMG es + en ceñida y − en popa: se promedia en valor absoluto
+        k["vmg_mean"] = nav["VMG_kts"].abs().mean()
     if "Fase" in df.columns:
         n = len(df)
-        k["pct_flight"] = 100 * df["Fase"].isin(["Popa", "Ceñida", "Través", "Transición"]).sum() / n
         k["pct_popa"]    = 100 * (df["Fase"] == "Popa").sum() / n
         k["pct_cenida"]  = 100 * (df["Fase"] == "Ceñida").sum() / n
         k["pct_traves"]  = 100 * (df["Fase"] == "Través").sum() / n
@@ -1541,6 +1548,31 @@ def compute_peak_speeds(df: pd.DataFrame, windows=(10, 30, 60)) -> dict:
     return result
 
 
+# ─── Estado de la sesión ─────────────────────────────────────────────────────
+def _fkey(f) -> str:
+    """Identificador estable de un archivo subido (las keys de sus widgets no dependen
+    de su posición, así que quitar o añadir archivos no mezcla nombres ni ajustes)."""
+    return f"{f.name}_{f.size}"
+
+
+def _reset_app():
+    """Vuelve a empezar de cero: vacía el uploader (cambiando su key) y todo el estado."""
+    nonce = st.session_state.get("_uploader_nonce", 0)
+    st.session_state.clear()
+    st.session_state["_uploader_nonce"] = nonce + 1
+
+
+def _open_trim():
+    """Reabre el selector de tramo partiendo del tramo actual."""
+    st.session_state.pop("trim_confirmed_for", None)
+    st.session_state["_offer_last_range"] = False
+    st.session_state["_trim_nonce"] = st.session_state.get("_trim_nonce", 0) + 1
+
+
+def _use_full_session():
+    st.session_state["trim_range"] = None
+
+
 # ─── Sidebar ─────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("🪁 Formula Kite")
@@ -1552,19 +1584,23 @@ with st.sidebar:
         type=["csv", "vkx"],
         accept_multiple_files=True,
         help="Un archivo por regatista. El dispositivo se detecta automáticamente.",
+        key=f"uploader_{st.session_state.get('_uploader_nonce', 0)}",
     )
 
     racer_names, racer_devices = [], []
     wind_box = None
     if uploaded_files:
+        st.button(
+            "🗑️ Reiniciar (quitar archivos)", on_click=_reset_app, use_container_width=True,
+        )
         st.divider()
         st.subheader("Regatistas")
         for i, f in enumerate(uploaded_files):
             default = os.path.splitext(f.name)[0].replace("_", " ").title()
-            name = st.text_input(f"Regatista {i + 1}", value=default, key=f"n{i}")
+            name = st.text_input(f"Regatista {i + 1}", value=default, key=f"n_{_fkey(f)}")
             detected = detect_device(f.name, f.getvalue())
             choice = st.selectbox(
-                "Dispositivo", ["Auto", *DEVICE_LABELS.values()], key=f"dev{i}",
+                "Dispositivo", ["Auto", *DEVICE_LABELS.values()], key=f"dev_{_fkey(f)}",
             )
             if choice == "Auto":
                 st.caption(f"Detectado: **{DEVICE_LABELS.get(detected, 'desconocido')}**")
@@ -1576,10 +1612,7 @@ with st.sidebar:
         wind_box = st.container()
 
         if st.session_state.get("trim_confirmed_for"):
-            if st.button("🔁 Cambiar tramo seleccionado"):
-                st.session_state.pop("trim_confirmed_for", None)
-                st.session_state.pop("trim_range", None)
-                st.rerun()
+            st.button("🔁 Cambiar tramo seleccionado", on_click=_open_trim)
 
     st.divider()
     st.markdown(
@@ -1633,40 +1666,79 @@ for i, (f, nm, dev) in enumerate(zip(uploaded_files, racer_names, racer_devices)
         except Exception as exc:
             st.error(f"❌ Error al cargar **{f.name}**: {exc}")
 
-# Viento de los Atlas: copiado de Sailmon, por maniobras (como Sailmon) o manual
-_sailmon_raw = [df for _, _, _, dev, df in tracks if dev == "sailmon"]
-if any(dev == "atlas" for _, _, _, dev, _ in tracks):
+# Viento común: una sola TWD para todos los regatistas, para que TWA, VMG y fases sean
+# coherentes entre ellos. Se toma de los Sailmon, por maniobras o manual, y se aplica a
+# todos los tracks (también a los Sailmon, cuya TWA/VMG se recalculan con esa TWD).
+def _circ_mean(deg) -> float:
+    rad = np.radians(np.asarray(deg, dtype=float))
+    rad = rad[~np.isnan(rad)]
+    return float(np.degrees(np.arctan2(np.sin(rad).mean(), np.cos(rad).mean())) % 360)
+
+
+if tracks:
+    _sailmon_raw = {
+        _fkey(f): (nm, df) for _, f, nm, dev, df in tracks
+        if dev == "sailmon" and "TWD" in df.columns and df["TWD"].notna().any()
+    }
+    _wind_labels = {}
+    if len(_sailmon_raw) > 1:
+        _wind_labels["sailmon_all"] = "Media de los Sailmon"
+    for fk, (nm, _) in _sailmon_raw.items():
+        _wind_labels[f"sailmon:{fk}"] = f"Sailmon · {nm}"
+    _wind_labels["estimate"] = "Por maniobras (todos los regatistas)"
+    _wind_labels["manual"] = "Manual (constante)"
+
+    # Estimación combinada: TWD por maniobras de cada track, mediana circular por segundo
+    _estimates = []
+    for _, _, _, _, df in tracks:
+        _est, _n, _ = estimate_twd(df)
+        if _est is not None:
+            _estimates.append((pd.DataFrame({"time": df["time"], "TWD": _est}), _n))
+    _n_man = sum(n for _, n in _estimates)
+
     with wind_box:
         st.divider()
-        st.subheader("Viento · Vakaros Atlas")
+        st.subheader("Viento (común a todos)")
+        src = st.selectbox(
+            "Origen de la TWD", list(_wind_labels), format_func=_wind_labels.get, key="wind_src",
+        )
+        if src.startswith("sailmon"):
+            _src_dfs = [d for _, d in _sailmon_raw.values()] if src == "sailmon_all" \
+                else [_sailmon_raw[src.split(":", 1)[1]][1]]
+            twd_for = lambda df: borrow_twd(df, _src_dfs)
+        elif src == "estimate":
+            twd_for = (lambda df: borrow_twd(df, [d for d, _ in _estimates])) if _estimates else (lambda df: None)
+        else:
+            _all_est = pd.concat([d["TWD"] for d, _ in _estimates]) if _estimates else []
+            _default = _circ_mean(_all_est) if len(_all_est) else 0.0
+            _twd_const = st.number_input(
+                "TWD (°)", min_value=0.0, max_value=359.0, step=1.0,
+                value=float(round(_default)) % 360, key="wind_twd",
+            )
+            twd_for = lambda df: _twd_const
+
+        _coverage = []
         for k, (i, f, nm, dev, df) in enumerate(tracks):
-            if dev != "atlas":
-                continue
-            options = ([WIND_SAILMON] if _sailmon_raw else []) + [WIND_ESTIMATE, WIND_MANUAL]
-            src = st.selectbox(f"Origen del viento · {nm}", options, key=f"wind_src{i}")
-            twd_man, n_man, twd_ref = estimate_twd(df)
-            if src == WIND_SAILMON:
-                twd = borrow_twd(df, _sailmon_raw)
-                st.caption(f"TWD de Sailmon en el {twd.notna().mean():.0%} del track.")
-            elif src == WIND_ESTIMATE:
-                twd = twd_man
-                if twd is not None:
-                    st.caption(
-                        f"TWD de **{n_man}** maniobras · mediana **{twd.median():.0f}°** "
-                        f"(rango {twd.quantile(0.05):.0f}–{twd.quantile(0.95):.0f}°). "
-                        "Sin viento hasta la primera maniobra."
-                    )
-            else:
-                _default = twd_man.median() if twd_man is not None else twd_ref
-                twd = st.number_input(
-                    "TWD (°)", min_value=0.0, max_value=359.0, step=1.0,
-                    value=float(round(_default)) if _default is not None else 0.0,
-                    key=f"wind_twd{i}",
-                )
+            twd = twd_for(df) if "COG" in df.columns else None
             if twd is None or (isinstance(twd, pd.Series) and twd.isna().all()):
-                st.info("Sin viento: las fases solo distinguen En vuelo / Caída, sin maniobras ni polares.")
+                # Sin TWD común para este track: se descarta también su viento propio
+                df = df.drop(columns=["TWD", "TWA", "VMG"], errors="ignore")
+                tracks[k] = (i, f, nm, dev, df)
+                _coverage.append((nm, 0.0))
             else:
                 tracks[k] = (i, f, nm, dev, apply_wind(df, twd))
+                _coverage.append((nm, twd.notna().mean() if isinstance(twd, pd.Series) else 1.0))
+
+        if src == "estimate" and _estimates:
+            st.caption(
+                f"TWD de **{_n_man}** maniobras de todos los regatistas · media "
+                f"**{_circ_mean(pd.concat([d['TWD'] for d, _ in _estimates])):.0f}°**. "
+                "Sin viento hasta la primera maniobra."
+            )
+        if src != "manual":
+            st.caption("Cobertura: " + " · ".join(f"{nm} {c:.0%}" for nm, c in _coverage))
+        if any(c == 0 for _, c in _coverage):
+            st.info("Sin viento en algún track: sus fases solo distinguen En vuelo / Caída, sin maniobras ni polares.")
 
 dfs_full = []
 files_full = []  # archivo original de cada df en dfs_full (para exportar el recorte)
@@ -1696,6 +1768,7 @@ _files_key = tuple((f.name, f.size) for f in uploaded_files)
 if st.session_state.get("_trim_files_key") != _files_key:
     st.session_state.pop("trim_range", None)
     st.session_state["_trim_files_key"] = _files_key
+    st.session_state["_offer_last_range"] = True
 
 
 @st.dialog("✂️ Selecciona el tramo a analizar", width="large")
@@ -1725,7 +1798,8 @@ def _trim_dialog():
     # una sesión ya recortada), ofrece reutilizarlo directamente en vez de tener
     # que volver a arrastrar el slider.
     _last_range = st.session_state.get("_last_confirmed_range")
-    if _last_range and not st.session_state.get("trim_range"):
+    if (_last_range and not st.session_state.get("trim_range")
+            and st.session_state.get("_offer_last_range")):
         _lo, _hi = _last_range
         if _lo < _t_max and _hi > _t_min:  # solapa con la sesión de los archivos actuales
             _clamped_lo = max(_lo, _t_min)
@@ -1770,7 +1844,9 @@ def _trim_dialog():
         start_clock_s=_start_clock_s,
         start_ms=_default_start_ms,
         end_ms=_default_end_ms,
-        key=f"trim_range_selector_{hash(_files_key)}",
+        # El nonce remonta el componente en cada apertura, para que arranque en el
+        # tramo actual (el JS solo lee start_ms/end_ms en el primer render).
+        key=f"trim_range_selector_{hash(_files_key)}_{st.session_state.get('_trim_nonce', 0)}",
     )
 
     if _result:
@@ -1824,6 +1900,9 @@ def _trim_dialog():
 
 if st.session_state.get("trim_confirmed_for") != _files_key:
     _trim_dialog()
+    # Por si se cierra el diálogo con la X: deja un botón para reabrirlo.
+    st.info("Elige el tramo de la sesión que quieres analizar.")
+    st.button("✂️ Seleccionar tramo", type="primary", on_click=_open_trim)
     st.stop()
 
 _trim_range = st.session_state.get("trim_range")
@@ -1862,6 +1941,23 @@ def _raw_trimmed_csv(file, trim_range) -> bytes:
     return raw.to_csv(index=False).encode("utf-8")
 
 
+_bar_info, _bar_change, _bar_full = st.columns([3, 1, 1])
+with _bar_info:
+    if _trim_range:
+        _mins = (_trim_range[1] - _trim_range[0]).total_seconds() / 60
+        st.markdown(
+            f"✂️ **Tramo:** {_trim_range[0].strftime('%H:%M:%S')} → "
+            f"{_trim_range[1].strftime('%H:%M:%S')} ({_mins:.0f} min)"
+        )
+    else:
+        st.markdown("✂️ **Tramo:** sesión completa")
+with _bar_change:
+    st.button("🔁 Cambiar tramo", on_click=_open_trim, use_container_width=True, key="bar_change_trim")
+with _bar_full:
+    if _trim_range:
+        st.button("Usar sesión completa", on_click=_use_full_session,
+                  use_container_width=True, key="bar_full_session")
+
 with st.expander("⬇️ Descargar CSV recortado por regatista"):
     st.caption(
         "Mismo formato que el export original (los .vkx se descargan como CSV del Atlas): "
@@ -1888,14 +1984,16 @@ cols = st.columns(len(dfs))
 for col, df in zip(cols, dfs):
     name = df["Regatista"].iloc[0]
     k = compute_kpis(df)
+    _kts = lambda key: f"{k[key]:.1f} kts" if pd.notna(k.get(key)) else "—"
     with col:
         st.markdown(f"#### {name}")
+        st.caption("Sin maniobras ni caídas.")
         c1, c2 = st.columns(2)
-        c1.metric("🚀 Vel. Máx.", f"{k.get('sog_max', 0):.1f} kts")
-        c2.metric("🎯 Vel. Media", f"{k.get('sog_mean', 0):.1f} kts")
+        c1.metric("🚀 Vel. Máx.", _kts("sog_max"))
+        c2.metric("🎯 Vel. Media", _kts("sog_mean"))
         c3, c4 = st.columns(2)
-        c3.metric("💨 VMG Máx.", f"{k.get('vmg_max', 0):.1f} kts" if "vmg_max" in k else "—")
-        c4.metric("✈️ % Vuelo", f"{k.get('pct_flight', 0):.1f}%")
+        c3.metric("💨 VMG Máx.", _kts("vmg_max"))
+        c4.metric("🧭 VMG Medio", _kts("vmg_mean"))
         if "Fase" in df.columns:
             st.markdown(
                 f"🔴 Popa **{k.get('pct_popa', 0):.1f}%** &nbsp;·&nbsp; "
