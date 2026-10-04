@@ -124,22 +124,28 @@ def track_replay(racers, duration_ms, start_clock_s, ahead_s=5, key=None):
     )
 
 
-def build_ghost_racers(df, i, recovered=None):
-    """Replay de una maniobra: tramo del barco y ghost que sigue recto (ver maneuver_ghost),
-    ambos con la TWD de entrada fija para que la línea de líder mida lo mismo que la tabla."""
+def build_ghost_racers(df, man_row):
+    """Replay de una maniobra (fila de detect_maneuvers): tramo del barco y ghost que va con él
+    hasta el inicio de la maniobra y luego sigue recto (ver maneuver_ghost), ambos con la TWD
+    de entrada fija para que la línea de líder mida lo mismo que la tabla."""
     df = df.reset_index(drop=True)
-    g, _ = maneuver_ghost(df, i, leg_vmg_ref(df), recovered)
+    _opt = lambda v: None if pd.isna(v) else int(v)
+    g, _ = maneuver_ghost(df, int(man_row["_i"]), leg_vmg_ref(df),
+                          _opt(man_row["_recovered"]), _opt(man_row["_start"]))
     if g is None:
         return None
     boat = df.iloc[g["a"]:g["b"] + 1].copy()
     boat["TWD"] = g["twd"]
     boat["Ghost_loss_m"] = g["loss"]
+    same = np.arange(len(boat)) <= g["start"]  # hasta el inicio de la maniobra, igual que el barco
+    _col = lambda c, after: np.where(same, boat[c].to_numpy(float), after) if c in boat else after
     ghost = pd.DataFrame({
         "time": boat["time"].to_numpy(),
         "latitude": g["lat"],
         "longitude": g["lon"],
-        "SOG_kts": g["sog_kts"],
-        "TWA": g["twa"],
+        "SOG_kts": _col("SOG_kts", g["sog_kts"]),
+        "VMG_kts": _col("VMG_kts", g["vmg_kts"]),
+        "TWA": _col("TWA", g["twa"]),
         "TWD": g["twd"],
         "Regatista": "Ghost",
     })
@@ -659,15 +665,17 @@ def leg_vmg_ref(df: pd.DataFrame) -> dict:
     return {k: float(v) for k, v in ref.items() if pd.notna(v)}
 
 
-def maneuver_ghost(df: pd.DataFrame, i: int, vmg_ref=None, recovered=None):
+def maneuver_ghost(df: pd.DataFrame, i: int, vmg_ref=None, recovered=None, start=None):
     """
-    Rival fantasma que no maniobra: sale de la posición del barco GHOST_PRE_S s antes del
-    cambio de amura `i` y sigue recto con el rumbo GPS de entrada, a la velocidad que le da un
+    Rival fantasma que no maniobra: hasta el inicio de la maniobra `start` (última muestra antes
+    de que caiga la SOG; como tarde ENTRY_WINDOW_S[1] s antes del cambio de amura `i`) va exactamente con el
+    barco, y desde ahí sigue recto con el rumbo GPS de entrada, a la velocidad que le da un
     VMG igual a la media entre el VMG de entrada (ENTRY_WINDOW_S) y el de salida (GHOST_EXIT_S)
     del barco. Así la pérdida es solo el coste de la maniobra, no el de cambiar de ángulo al
     viento antes o después. Se mide en el eje del viento (como la línea de líder del mapa de
     track), con la TWD de entrada fija: metros que el ghost avanza hacia barlovento (ceñida) o
-    sotavento (popa) más que el barco, GHOST_POST_S s después del cambio de amura.
+    sotavento (popa) más que el barco, GHOST_POST_S s después del cambio de amura. La ventana
+    devuelta empieza GHOST_PRE_S s antes del cambio de amura.
     Devuelve (ghost, None) o (None, motivo) si no es comparable: sin viento o GPS, ventana fuera
     del track, otra maniobra antes de acabar la ventana, rodeo de baliza, rumbo irregular
     (> GHOST_MAX_COURSE_DEV) o VMG por debajo de GHOST_MIN_VMG_FRAC del normal de la borda
@@ -731,17 +739,21 @@ def maneuver_ghost(df: pd.DataFrame, i: int, vmg_ref=None, recovered=None):
     if along < 0.1:
         return None, "rumbo irregular antes o después"
 
-    # Ghost recto con el rumbo de entrada y SOG tal que su VMG sea la media entrada/salida
+    # Hasta el inicio de la maniobra el ghost es el barco; desde ahí, recto con el rumbo de
+    # entrada y SOG tal que su VMG sea la media entrada/salida
+    ks = (max(a, min(start, i - e1)) if start is not None else i - e1) - a
     vmg_target = (vmg_in + vmg_out) / 2
     speed = vmg_target / along
-    t = secs[:b - a + 1]
-    ge, gn = speed * t * np.sin(hdg), speed * t * np.cos(hdg)
-    loss = vmg_target * t - up[:b - a + 1]
+    t = np.maximum(secs[:b - a + 1] - secs[ks], 0)
+    ge = np.where(t > 0, e[ks] + speed * t * np.sin(hdg), e[:b - a + 1])
+    gn = np.where(t > 0, n[ks] + speed * t * np.cos(hdg), n[:b - a + 1])
+    loss = np.where(t > 0, vmg_target * t - (up[:b - a + 1] - up[ks]), 0.0)
     return {
-        "a": a, "b": b,
+        "a": a, "b": b, "start": ks,
         "twd": float(np.degrees(twd0) % 360),
         "twa": float(np.nanmean(twa[i - e0:i - e1])),
         "sog_kts": float(speed * MS_TO_KNOTS),
+        "vmg_kts": float(sign * vmg_target * MS_TO_KNOTS),
         "lat": lat[0] + gn / ky,
         "lon": lon[0] + ge / kx,
         "loss": loss,
@@ -820,7 +832,7 @@ def detect_maneuvers(df: pd.DataFrame) -> pd.DataFrame:
             failed = min_sog < FALL_KTS
             recovered = drop_start + rec if isinstance(rec, int) else None
             ghost, motivo = ((None, "caída") if failed
-                             else maneuver_ghost(df, i, vmg_ref, recovered))
+                             else maneuver_ghost(df, i, vmg_ref, recovered, drop_start - 1))
             row = {
                 "Tipo":            mtype,
                 "Estado":          "🔴 Fallida" if failed else "✅ OK",
@@ -832,6 +844,7 @@ def detect_maneuvers(df: pd.DataFrame) -> pd.DataFrame:
                 "_i":              i,
                 "_motivo":         motivo,
                 "_recovered":      recovered,
+                "_start":          drop_start - 1,  # última muestra antes de frenar
             }
             if "time" in df.columns:
                 row["Tiempo"] = df["time"].iloc[i]
@@ -2392,10 +2405,10 @@ for df in dfs:
             "Pérdida (m)": st.column_config.NumberColumn(
                 "Pérdida (m)",
                 format="%.0f m",
-                help=f"👻 **Metros perdidos frente a un ghost** que sale de tu posición "
-                     f"{GHOST_PRE_S} s antes del cambio de amura y sigue recto con tu rumbo de "
-                     "entrada, a un VMG igual a la media de tu VMG antes y después de la "
-                     "maniobra. Se mide en el eje del viento (avance hacia barlovento en "
+                help="👻 **Metros perdidos frente a un ghost** que va contigo hasta que "
+                     "empiezas la maniobra (empieza a caer la SOG) y desde ahí sigue recto con "
+                     "tu rumbo de entrada, a un VMG igual a la media de tu VMG antes y después "
+                     "de la maniobra. Se mide en el eje del viento (avance hacia barlovento en "
                      f"ceñida, hacia sotavento en popa) {GHOST_POST_S} s después del cambio de "
                      "amura. Negativo = ganas al ghost. "
                      "**—**: maniobra fallida, otra maniobra muy seguida, rodeo de baliza, rumbo irregular o VMG muy bajo "
@@ -2443,8 +2456,7 @@ for df in dfs:
                 continue
             st.markdown(f"##### 👻 {m['Tipo']} {hora} · {m['Estado']} · "
                         f"**{m['Pérdida (m)']:.0f} m** perdidos frente al ghost")
-            ghost_replay = build_ghost_racers(
-                df, int(m["_i"]), None if pd.isna(m["_recovered"]) else int(m["_recovered"]))
+            ghost_replay = build_ghost_racers(df, m)
             if ghost_replay:
                 track_replay(*ghost_replay, key=f"ghost_{name}_{int(m['_i'])}")
 
