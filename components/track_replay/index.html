@@ -636,7 +636,9 @@
             iB = bsearch(r.t, tB);
           const px = sx(mx(p.lon)),
             py = sy(my(p.lat));
-          ctx.globalAlpha = 1;
+          // el ghost (rival ficticio de las maniobras) va translúcido y con traza discontinua
+          ctx.globalAlpha = r.ghost ? 0.6 : 1;
+          ctx.setLineDash(r.ghost ? [6, 5] : []);
           ctx.strokeStyle = r.color;
           ctx.lineWidth = 3.5;
           ctx.lineJoin = "round";
@@ -652,12 +654,18 @@
             ctx.lineTo(sx(r.wx[i]), sy(r.wy[i]));
           ctx.lineTo(sx(b0[0]), sy(b0[1]));
           ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.globalAlpha = 1;
           boats.push({ r, p, px, py });
         });
         // 3) línea de líder perpendicular al viento (como Sailmon) + barcos + viento
         const twd = windAt();
         if (twd !== null && boats.length >= 2) drawLadder(boats, twd);
-        boats.forEach((b) => boatPath(ctx, b.px, b.py, b.p.hdg || 0, b.r.color));
+        boats.forEach((b) => {
+          ctx.globalAlpha = b.r.ghost ? 0.6 : 1;
+          boatPath(ctx, b.px, b.py, b.p.hdg || 0, b.r.color);
+        });
+        ctx.globalAlpha = 1;
         drawWind(twd);
         ctx.fillStyle = "rgba(255,255,255,0.45)";
         ctx.font = "10px sans-serif";

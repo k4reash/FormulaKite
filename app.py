@@ -67,6 +67,7 @@ REPLAY_METRICS = [  # (etiqueta, columna, unidad) — datos elegibles en la grá
     ("COG", "COG", "°"),
     ("TWD", "TWD", "°"),
     ("Trim proa/popa", "Trim Fore / Aft", "°"),
+    ("Pérdida vs ghost", "Ghost_loss_m", "m"),  # solo en los replays de maniobra
 ]
 
 
@@ -122,6 +123,31 @@ def track_replay(racers, duration_ms, start_clock_s, ahead_s=5, key=None):
         default=None,
     )
 
+
+def build_ghost_racers(df, i, recovered=None):
+    """Replay de una maniobra: tramo del barco y ghost que sigue recto (ver maneuver_ghost),
+    ambos con la TWD de entrada fija para que la línea de líder mida lo mismo que la tabla."""
+    df = df.reset_index(drop=True)
+    g, _ = maneuver_ghost(df, i, leg_vmg_ref(df), recovered)
+    if g is None:
+        return None
+    boat = df.iloc[g["a"]:g["b"] + 1].copy()
+    boat["TWD"] = g["twd"]
+    boat["Ghost_loss_m"] = g["loss"]
+    ghost = pd.DataFrame({
+        "time": boat["time"].to_numpy(),
+        "latitude": g["lat"],
+        "longitude": g["lon"],
+        "SOG_kts": g["sog_kts"],
+        "TWA": g["twa"],
+        "TWD": g["twd"],
+        "Regatista": "Ghost",
+    })
+    racers, duration_ms, start_clock_s = build_replay_racers([boat, ghost])
+    racers[1]["color"] = "#cbd5e1"
+    racers[1]["ghost"] = True
+    return racers, duration_ms, start_clock_s
+
 # ─── Configuración de página ─────────────────────────────────────────────────
 st.set_page_config(
     page_title="Formula Kite Analytics",
@@ -154,6 +180,12 @@ RECOVERY_FRAC   = 0.90  # recovery: hasta recuperar el 90 % de la SOG de entrada
 DROP_START_FRAC = 0.95  # la caída empieza cuando la SOG baja del 95 % de la de entrada
 ENTRY_WINDOW_S  = (15, 5)  # SOG de entrada: media entre 15 y 5 s antes del cambio de amura
 EXIT_WINDOW_S   = (20, 40)  # SOG de salida: mediana entre 20 y 40 s después (rumbo ya estable)
+GHOST_PRE_S     = 15  # el ghost sale de la posición del barco 15 s antes del cambio de amura
+GHOST_POST_S    = 30  # pérdida medida 30 s después del cambio de amura (ventana fija, comparable)
+GHOST_EXIT_S    = (20, 30)  # VMG de salida del ghost: entre 20 y 30 s después (10 s, como la entrada)
+GHOST_REC_MARGIN_S = 5      # si recupera tarde, la salida empieza 5 s después del recovery
+GHOST_MAX_COURSE_DEV = 15   # ° máx. de variación del rumbo en las ventanas de entrada/salida
+GHOST_MIN_VMG_FRAC   = 0.5  # VMG de entrada/salida mínimo, como fracción del normal de la borda
 FOIL_FLIGHT_KTS = 6   # por debajo de este umbral el foil no vuela. Estimado de los CSV: el vuelo
                       # sostenido empieza en ~9 kts, 5-8 kts son solo transitorios y hay maniobras
                       # sin caída con SOG mín de 6.7 kts
@@ -166,6 +198,8 @@ TWA_UPWIND_MAX   = 70   # |TWA| < 70° → Ceñida
 TWA_DOWNWIND_MIN = 110  # |TWA| > 110° → Popa
 MANEUVER_WINDOW_S   = 8     # s antes y después que se comparan para confirmar el cambio de amura
 MANEUVER_SIDE_MIN   = 0.25  # |media de sin(TWA)| mínima a cada lado (≈ TWA a >15° de proa/popa)
+MANEUVER_TURN_MIN   = 40    # ° de giro del TWA medio para confirmar maniobras muy cerradas o muy
+MANEUVER_DEEP_SIDE  = 0.5   # abiertas (|sin| < 0.25 en un lado) si el otro lado tiene |sin| ≥ 0.5
 MANEUVER_RATE_MIN   = 4     # °/s: la maniobra dura mientras el TWA gire más rápido que esto
 MANEUVER_MAX_EXT_S  = 10    # máx. segundos que se extiende la maniobra a cada lado del cruce
 MANEUVER_PAD_S      = 1     # segundos añadidos al principio y al final
@@ -202,6 +236,8 @@ def _maneuver_mask(twa: pd.Series) -> np.ndarray:
     Marca las viradas/trasluchadas (cambios de amura) en una serie de TWA a 1 Hz.
     1. Cambio de amura confirmado: la media de sin(TWA) en los MANEUVER_WINDOW_S
        anteriores y posteriores tiene signo opuesto (las eses a popa no lo cumplen).
+       Una trasluchada desde popa profunda (TWA ≈ ±175°) o una virada desde un TWA muy cerrado
+       solo tiene |sin| alto en un lado: vale también si el TWA medio gira ≥ MANEUVER_TURN_MIN.
     2. Desde el cruce del TWA, la maniobra se extiende a cada lado mientras el TWA
        siga girando a más de MANEUVER_RATE_MIN °/s (máx. MANEUVER_MAX_EXT_S).
     """
@@ -210,13 +246,17 @@ def _maneuver_mask(twa: pd.Series) -> np.ndarray:
     if twa.notna().sum() < 2:
         return mask
 
-    side = np.sin(np.radians(twa))
-    before = side.rolling(MANEUVER_WINDOW_S, min_periods=MANEUVER_WINDOW_S // 2).mean()
+    rad = np.radians(twa)
+    before = np.sin(rad).rolling(MANEUVER_WINDOW_S, min_periods=MANEUVER_WINDOW_S // 2).mean()
     after = before.shift(-MANEUVER_WINDOW_S)
+    cos_b = np.cos(rad).rolling(MANEUVER_WINDOW_S, min_periods=MANEUVER_WINDOW_S // 2).mean()
+    cos_a = cos_b.shift(-MANEUVER_WINDOW_S)
+    turn = _wrap180(np.degrees(np.arctan2(after, cos_a) - np.arctan2(before, cos_b))).abs()
+    flip = before * after < 0
     confirmed = (
-        (before * after < 0)
-        & (before.abs() >= MANEUVER_SIDE_MIN)
-        & (after.abs() >= MANEUVER_SIDE_MIN)
+        (flip & (before.abs() >= MANEUVER_SIDE_MIN) & (after.abs() >= MANEUVER_SIDE_MIN))
+        | (flip & (turn >= MANEUVER_TURN_MIN)
+           & (np.maximum(before.abs(), after.abs()) >= MANEUVER_DEEP_SIDE))
     ).to_numpy()
 
     t = twa.ffill().bfill().to_numpy(dtype=float)
@@ -236,15 +276,20 @@ def _maneuver_mask(twa: pd.Series) -> np.ndarray:
         while j < n and confirmed[j]:
             j += 1
         lo, hi = max(1, i - MANEUVER_WINDOW_S), min(n, j + MANEUVER_WINDOW_S)
-        flips = np.nonzero((sign[lo:hi] != sign[lo - 1:hi - 1]) & (sign[lo:hi] != 0))[0]
-        c = lo + flips[0] if len(flips) else (i + j) // 2
-        s = c
-        while s > 0 and c - s < MANEUVER_MAX_EXT_S and rate[s - 1] > MANEUVER_RATE_MIN:
-            s -= 1
-        e = c
-        while e < n - 1 and e - c < MANEUVER_MAX_EXT_S and rate[e + 1] > MANEUVER_RATE_MIN:
-            e += 1
-        mask[max(0, s - MANEUVER_PAD_S): e + MANEUVER_PAD_S + 1] = True
+        flips = lo + np.nonzero((sign[lo:hi] != sign[lo - 1:hi - 1]) & (sign[lo:hi] != 0))[0]
+        # Dos maniobras seguidas (< 2·MANEUVER_WINDOW_S) dan un solo tramo confirmado:
+        # se marcan todos los cruces confirmados, no solo el primero
+        centers = [c for c in flips if confirmed[max(0, c - 3):c + 3].any()]
+        if not centers:
+            centers = [flips[0] if len(flips) else (i + j) // 2]
+        for c in centers:
+            s = c
+            while s > 0 and c - s < MANEUVER_MAX_EXT_S and rate[s - 1] > MANEUVER_RATE_MIN:
+                s -= 1
+            e = c
+            while e < n - 1 and e - c < MANEUVER_MAX_EXT_S and rate[e + 1] > MANEUVER_RATE_MIN:
+                e += 1
+            mask[max(0, s - MANEUVER_PAD_S): e + MANEUVER_PAD_S + 1] = True
         i = j
     return mask
 
@@ -604,6 +649,105 @@ def compute_kpis(df: pd.DataFrame) -> dict:
     return k
 
 
+def leg_vmg_ref(df: pd.DataFrame) -> dict:
+    """VMG normal (m/s, mediana de |VMG|) en Ceñida (+1) y Popa (−1), para descartar maniobras
+    con entrada o salida a un VMG muy por debajo del habitual en la borda."""
+    if not {"VMG", "Fase"} <= set(df.columns):
+        return {}
+    vmg = pd.to_numeric(df["VMG"], errors="coerce").abs()
+    ref = {1: vmg[df["Fase"] == "Ceñida"].median(), -1: vmg[df["Fase"] == "Popa"].median()}
+    return {k: float(v) for k, v in ref.items() if pd.notna(v)}
+
+
+def maneuver_ghost(df: pd.DataFrame, i: int, vmg_ref=None, recovered=None):
+    """
+    Rival fantasma que no maniobra: sale de la posición del barco GHOST_PRE_S s antes del
+    cambio de amura `i` y sigue recto con el rumbo GPS de entrada, a la velocidad que le da un
+    VMG igual a la media entre el VMG de entrada (ENTRY_WINDOW_S) y el de salida (GHOST_EXIT_S)
+    del barco. Así la pérdida es solo el coste de la maniobra, no el de cambiar de ángulo al
+    viento antes o después. Se mide en el eje del viento (como la línea de líder del mapa de
+    track), con la TWD de entrada fija: metros que el ghost avanza hacia barlovento (ceñida) o
+    sotavento (popa) más que el barco, GHOST_POST_S s después del cambio de amura.
+    Devuelve (ghost, None) o (None, motivo) si no es comparable: sin viento o GPS, ventana fuera
+    del track, otra maniobra antes de acabar la ventana, rodeo de baliza, rumbo irregular
+    (> GHOST_MAX_COURSE_DEV) o VMG por debajo de GHOST_MIN_VMG_FRAC del normal de la borda
+    (`vmg_ref`, ver leg_vmg_ref) antes o después.
+    `df` con índice 0..n-1 a 1 Hz.
+    """
+    if not {"time", "latitude", "longitude", "TWD", "TWA"} <= set(df.columns):
+        return None, "sin viento o GPS"
+    e0, e1 = ENTRY_WINDOW_S
+    x0, x1 = GHOST_EXIT_S
+    if recovered is not None and recovered + GHOST_REC_MARGIN_S > i + x0:
+        # salida medida ya recuperado: si no, el ghost frenaría con la recuperación lenta
+        x0 = recovered + GHOST_REC_MARGIN_S - i
+        x1 = x0 + GHOST_EXIT_S[1] - GHOST_EXIT_S[0]
+    a, b = i - GHOST_PRE_S, i + GHOST_POST_S
+    end = max(b, i + x1)
+    if a < 0 or a > i - e0 or end >= len(df):
+        return None, "demasiado cerca del inicio o fin del tramo"
+
+    lat = df["latitude"].to_numpy(float)[a:end + 1]
+    lon = df["longitude"].to_numpy(float)[a:end + 1]
+    twa = df["TWA"].to_numpy(float)
+    twd = np.radians(df["TWD"].to_numpy(float)[i - e0:i - e1])
+    cos_in = np.nanmean(np.cos(np.radians(twa[i - e0:i - e1])))
+    cos_out = np.nanmean(np.cos(np.radians(twa[i + x0:i + x1])))
+    if (not np.isfinite(twd).any() or not np.isfinite([cos_in, cos_out]).all()
+            or not np.isfinite(lat).all() or not np.isfinite(lon).all()):
+        return None, "sin viento o GPS"
+    after = twa[i + MANEUVER_WINDOW_S:i + x1]
+    if (np.sign(after[1:]) * np.sign(after[:-1]) < 0).any():  # otro cambio de amura
+        return None, f"otra maniobra antes de {x1} s"
+    if cos_in * cos_out < 0:
+        return None, "rodeo de baliza"
+    twd0 = float(np.arctan2(np.nanmean(np.sin(twd)), np.nanmean(np.cos(twd))))
+    sign = 1.0 if cos_in > 0 else -1.0  # ceñida: gana el de barlovento; popa: el de sotavento
+    ux, uy = sign * np.sin(twd0), sign * np.cos(twd0)
+
+    # Plano local en metros con origen en la salida del ghost (misma aproximación que drawLadder)
+    kx, ky = np.cos(np.radians(lat[0])) * 111320, 110540
+    e, n = (lon - lon[0]) * kx, (lat - lat[0]) * ky
+    up = e * ux + n * uy
+    secs = (df["time"].iloc[a:end + 1] - df["time"].iloc[a]).dt.total_seconds().to_numpy()
+
+    def _course(j0, j1):
+        """Rumbo medio (cuerda) y desviación máx. del rumbo segundo a segundo en [j0, j1]."""
+        k0, k1 = j0 - a, j1 - a
+        hdg = np.arctan2(e[k1] - e[k0], n[k1] - n[k0])
+        steps = np.arctan2(np.diff(e[k0:k1 + 1]), np.diff(n[k0:k1 + 1]))
+        dev = np.abs(_wrap180(np.degrees(steps - hdg))).max()
+        vmg = (up[k1] - up[k0]) / (secs[k1] - secs[k0])
+        return hdg, dev, vmg
+
+    hdg, dev_in, vmg_in = _course(i - e0, i - e1)
+    _, dev_out, vmg_out = _course(i + x0, i + x1)
+    if max(dev_in, dev_out) > GHOST_MAX_COURSE_DEV:
+        return None, "rumbo irregular antes o después"
+    ref = (vmg_ref or {}).get(int(sign))
+    if ref and min(vmg_in, vmg_out) < GHOST_MIN_VMG_FRAC * ref:
+        return None, "VMG bajo antes o después"
+    along = np.sin(hdg) * ux + np.cos(hdg) * uy  # fracción del rumbo del ghost que es VMG
+    if along < 0.1:
+        return None, "rumbo irregular antes o después"
+
+    # Ghost recto con el rumbo de entrada y SOG tal que su VMG sea la media entrada/salida
+    vmg_target = (vmg_in + vmg_out) / 2
+    speed = vmg_target / along
+    t = secs[:b - a + 1]
+    ge, gn = speed * t * np.sin(hdg), speed * t * np.cos(hdg)
+    loss = vmg_target * t - up[:b - a + 1]
+    return {
+        "a": a, "b": b,
+        "twd": float(np.degrees(twd0) % 360),
+        "twa": float(np.nanmean(twa[i - e0:i - e1])),
+        "sog_kts": float(speed * MS_TO_KNOTS),
+        "lat": lat[0] + gn / ky,
+        "lon": lon[0] + ge / kx,
+        "loss": loss,
+    }, None
+
+
 def detect_maneuvers(df: pd.DataFrame) -> pd.DataFrame:
     """
     Detecta viradas y trasluchadas por cambio de signo en TWA.
@@ -615,6 +759,10 @@ def detect_maneuvers(df: pd.DataFrame) -> pd.DataFrame:
         entrada) hasta recuperar RECOVERY_FRAC de la velocidad de referencia: la menor entre la
         de entrada y la de salida (una trasluchada en la boya de sotavento que sale a ceñida no
         puede recuperar la velocidad de popa)
+      - Pérdida (m): metros que saca en el eje del viento un ghost que sigue recto sin maniobrar
+        (ver maneuver_ghost), GHOST_POST_S s después del cambio de amura. NaN en las fallidas o
+        si no es comparable (`_motivo`). `_i` es el índice del cambio de amura, para
+        reconstruir el ghost.
     """
     if "TWA" not in df.columns or "SOG_kts" not in df.columns:
         return pd.DataFrame()
@@ -626,6 +774,7 @@ def detect_maneuvers(df: pd.DataFrame) -> pd.DataFrame:
     rows = []
     i = 1
     GAP = 8  # mínimo de segundos entre maniobras detectadas
+    vmg_ref = leg_vmg_ref(df)
 
     while i < len(twa) - 1:
         prev, curr = twa[i - 1], twa[i]
@@ -668,13 +817,21 @@ def detect_maneuvers(df: pd.DataFrame) -> pd.DataFrame:
                     rec = j - drop_start
                     break
 
+            failed = min_sog < FALL_KTS
+            recovered = drop_start + rec if isinstance(rec, int) else None
+            ghost, motivo = ((None, "caída") if failed
+                             else maneuver_ghost(df, i, vmg_ref, recovered))
             row = {
                 "Tipo":            mtype,
-                "Estado":          "🔴 Fallida" if min_sog < FALL_KTS else "✅ OK",
+                "Estado":          "🔴 Fallida" if failed else "✅ OK",
                 "SOG antes (kts)": round(sog_before, 1),
                 "SOG mín (kts)":   round(min_sog, 1),
                 "Caída (kts)":     round(sog_before - min_sog, 1),
                 "Recovery (s)":    rec,
+                "Pérdida (m)":     round(float(ghost["loss"][-1]), 1) if ghost else np.nan,
+                "_i":              i,
+                "_motivo":         motivo,
+                "_recovered":      recovered,
             }
             if "time" in df.columns:
                 row["Tiempo"] = df["time"].iloc[i]
@@ -2038,58 +2195,8 @@ st.plotly_chart(build_speed_timeline(dfs), use_container_width=True)
 st.divider()
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECCIÓN 4 · POLARES (SOG + VMG)
+# SECCIÓN 4 · ESCORA (HEEL) VS VELOCIDAD
 # ═══════════════════════════════════════════════════════════════════════════════
-has_vmg  = any("VMG_kts" in d.columns for d in dfs)
-has_fase = any("Fase" in d.columns for d in dfs)
-has_twa  = any("TWA" in d.columns for d in dfs)
-
-pl, pr = st.columns(2)
-with pl:
-    section("🧭 Polar Comparativa")
-    if has_twa:
-        st.caption(
-            "Velocidad media (SOG) por ángulo al viento, en fases de vuelo (Ceñida, Través y Popa). "
-            "El eje angular va de 0° (viento de frente) a 180° (viento de popa exacta). "
-            "Los dos picos muestran los **ángulos donde se alcanza más velocidad**. "
-            "En comparativas, la curva más exterior indica mayor velocidad en ese ángulo."
-        )
-        st.plotly_chart(build_polar(dfs), use_container_width=True)
-    else:
-        st.info("Sin datos de TWA para construir la polar.")
-with pr:
-    section("🎯 Polar de VMG")
-    if has_vmg and has_twa:
-        st.caption(
-            "Muestra la velocidad real hacia el destino (VMG) según el ángulo al viento (TWA), "
-            "solo en fases de vuelo (Ceñida, Través y Popa). "
-            "El eje angular va de 0° (viento de frente) a 180° (viento de popa). "
-            "Los dos picos de la curva indican los **ángulos óptimos** de ceñida y popa. "
-            "Un pico más alto y exterior = más VMG a ese ángulo. "
-            "En comparativas, la curva más exterior gana en avance real."
-        )
-        st.plotly_chart(build_vmg_polar(dfs), use_container_width=True)
-    else:
-        st.info("Sin datos de VMG o TWA.")
-
-st.divider()
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECCIÓN 5 · CONSISTENCIA POR FASE + ESCORA
-# ═══════════════════════════════════════════════════════════════════════════════
-if has_fase:
-    section("📦 Consistencia por Fase")
-    st.caption(
-        "Distribución de SOG en Popa, Través y Ceñida. "
-        "La caja muestra el rango del 50% central de los datos (P25–P75); "
-        "la línea central es la mediana y el rombo la media. "
-        "Una caja estrecha y alta indica velocidad constante a ritmo elevado (consistente). "
-        "Una caja ancha y baja indica velocidad irregular (inconsistente). "
-        "En comparativas, el regatista con la caja más alta y estrecha domina esa fase."
-    )
-    st.plotly_chart(build_phase_boxplot(dfs), use_container_width=True)
-
-# ─── Heel Analysis ────────────────────────────────────────────────────────────
 has_heel = any("Heel" in d.columns for d in dfs)
 if has_heel:
     section("⛵ Escora (Heel) vs Velocidad")
@@ -2106,7 +2213,7 @@ if has_heel:
 st.divider()
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECCIÓN 6 · VELOCIDAD PICO + TABLA DE BORDES
+# SECCIÓN 5 · VELOCIDAD PICO + TABLA DE BORDES
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ── Velocidad pico ────────────────────────────────────────────────────────────
@@ -2193,7 +2300,7 @@ for df in dfs:
 st.divider()
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECCIÓN 7 · DETECCIÓN DE MANIOBRAS
+# SECCIÓN 6 · DETECCIÓN DE MANIOBRAS
 # ═══════════════════════════════════════════════════════════════════════════════
 section("🔄 Detección de Maniobras (Viradas & Trasluchadas)")
 
@@ -2219,7 +2326,9 @@ for df in dfs:
         failed   = man[man["Estado"] == "🔴 Fallida"] if "Estado" in man.columns else pd.DataFrame()
         num_rec  = pd.to_numeric(man["Recovery (s)"], errors="coerce")
 
-        cm1, cm2, cm3, cm4, cm5 = st.columns(5)
+        _loss_mean = lambda sub: (f"{sub['Pérdida (m)'].mean():.0f} m"
+                                  if sub["Pérdida (m)"].notna().any() else "—")
+        cm1, cm2, cm3, cm4, cm5, cm6, cm7 = st.columns(7)
         cm1.metric("Viradas",         len(tacks))
         cm2.metric("Trasluchadas",    len(gybes))
         cm3.metric(
@@ -2227,13 +2336,18 @@ for df in dfs:
             f"{num_rec.mean():.0f} s" if not num_rec.isna().all() else "—",
         )
         cm4.metric("Caída SOG media", f"{man['Caída (kts)'].mean():.1f} kts")
-        cm5.metric("🔴 Fallidas",       len(failed),
+        cm5.metric("Pérdida virada", _loss_mean(tacks),
+                   help="Metros medios perdidos por virada frente a un ghost que sigue recto.")
+        cm6.metric("Pérdida trasluchada", _loss_mean(gybes),
+                   help="Metros medios perdidos por trasluchada frente a un ghost que sigue recto.")
+        cm7.metric("🔴 Fallidas",       len(failed),
                    help=f"Maniobras en las que la velocidad bajó de {FALL_KTS} kts (caída al agua).")
 
         # Tabla de maniobras
         disp_cols = [
             c for c in
-            ["Tiempo", "Tipo", "Estado", "SOG antes (kts)", "SOG mín (kts)", "Caída (kts)", "Recovery (s)"]
+            ["Tiempo", "Tipo", "Estado", "SOG antes (kts)", "SOG mín (kts)", "Caída (kts)",
+             "Recovery (s)", "Pérdida (m)"]
             if c in man.columns
         ]
         col_cfg = {
@@ -2275,6 +2389,19 @@ for df in dfs:
                      "a ceñida). "
                      "Un recovery bajo indica una maniobra más limpia y rápida.",
             ),
+            "Pérdida (m)": st.column_config.NumberColumn(
+                "Pérdida (m)",
+                format="%.0f m",
+                help=f"👻 **Metros perdidos frente a un ghost** que sale de tu posición "
+                     f"{GHOST_PRE_S} s antes del cambio de amura y sigue recto con tu rumbo de "
+                     "entrada, a un VMG igual a la media de tu VMG antes y después de la "
+                     "maniobra. Se mide en el eje del viento (avance hacia barlovento en "
+                     f"ceñida, hacia sotavento en popa) {GHOST_POST_S} s después del cambio de "
+                     "amura. Negativo = ganas al ghost. "
+                     "**—**: maniobra fallida, otra maniobra muy seguida, rodeo de baliza, rumbo irregular o VMG muy bajo "
+                     "antes o después (entrada/salida no comparable), o sin viento. "
+                     "Selecciona filas para ver el replay contra el ghost.",
+            ),
         }
 
         # Colorear en rojo las filas de maniobras fallidas
@@ -2283,11 +2410,14 @@ for df in dfs:
             return [color] * len(row)
 
         styled = man[disp_cols].style.apply(_highlight_failed, axis=1)
-        st.dataframe(
+        man_sel = st.dataframe(
             styled,
             column_config=col_cfg,
             use_container_width=True,
             hide_index=True,
+            on_select="rerun",
+            selection_mode="multi-row",
+            key=f"man_sel_{name}",
         )
 
         # Gráficos de maniobras lado a lado
@@ -2300,3 +2430,73 @@ for df in dfs:
             drop_chart = build_maneuver_sog_chart(man)
             if drop_chart:
                 st.plotly_chart(drop_chart, use_container_width=True)
+
+        # Replay contra el ghost de cada maniobra seleccionada en la tabla
+        sel_rows = man_sel.selection.rows if man_sel else []
+        if not sel_rows:
+            st.caption("👻 Selecciona maniobras en la tabla para ver el replay contra el ghost.")
+        for r in sel_rows:
+            m = man.iloc[r]
+            hora = m["Tiempo"].strftime("%H:%M:%S") if "Tiempo" in m else ""
+            if pd.isna(m["Pérdida (m)"]):
+                st.info(f"👻 {m['Tipo']} {hora}: sin ghost ({m['_motivo']}).")
+                continue
+            st.markdown(f"##### 👻 {m['Tipo']} {hora} · {m['Estado']} · "
+                        f"**{m['Pérdida (m)']:.0f} m** perdidos frente al ghost")
+            ghost_replay = build_ghost_racers(
+                df, int(m["_i"]), None if pd.isna(m["_recovered"]) else int(m["_recovered"]))
+            if ghost_replay:
+                track_replay(*ghost_replay, key=f"ghost_{name}_{int(m['_i'])}")
+
+st.divider()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECCIÓN 7 · POLARES (SOG + VMG)
+# ═══════════════════════════════════════════════════════════════════════════════
+has_vmg  = any("VMG_kts" in d.columns for d in dfs)
+has_fase = any("Fase" in d.columns for d in dfs)
+has_twa  = any("TWA" in d.columns for d in dfs)
+
+pl, pr = st.columns(2)
+with pl:
+    section("🧭 Polar Comparativa")
+    if has_twa:
+        st.caption(
+            "Velocidad media (SOG) por ángulo al viento, en fases de vuelo (Ceñida, Través y Popa). "
+            "El eje angular va de 0° (viento de frente) a 180° (viento de popa exacta). "
+            "Los dos picos muestran los **ángulos donde se alcanza más velocidad**. "
+            "En comparativas, la curva más exterior indica mayor velocidad en ese ángulo."
+        )
+        st.plotly_chart(build_polar(dfs), use_container_width=True)
+    else:
+        st.info("Sin datos de TWA para construir la polar.")
+with pr:
+    section("🎯 Polar de VMG")
+    if has_vmg and has_twa:
+        st.caption(
+            "Muestra la velocidad real hacia el destino (VMG) según el ángulo al viento (TWA), "
+            "solo en fases de vuelo (Ceñida, Través y Popa). "
+            "El eje angular va de 0° (viento de frente) a 180° (viento de popa). "
+            "Los dos picos de la curva indican los **ángulos óptimos** de ceñida y popa. "
+            "Un pico más alto y exterior = más VMG a ese ángulo. "
+            "En comparativas, la curva más exterior gana en avance real."
+        )
+        st.plotly_chart(build_vmg_polar(dfs), use_container_width=True)
+    else:
+        st.info("Sin datos de VMG o TWA.")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECCIÓN 8 · CONSISTENCIA POR FASE
+# ═══════════════════════════════════════════════════════════════════════════════
+if has_fase:
+    st.divider()
+    section("📦 Consistencia por Fase")
+    st.caption(
+        "Distribución de SOG en Popa, Través y Ceñida. "
+        "La caja muestra el rango del 50% central de los datos (P25–P75); "
+        "la línea central es la mediana y el rombo la media. "
+        "Una caja estrecha y alta indica velocidad constante a ritmo elevado (consistente). "
+        "Una caja ancha y baja indica velocidad irregular (inconsistente). "
+        "En comparativas, el regatista con la caja más alta y estrecha domina esa fase."
+    )
+    st.plotly_chart(build_phase_boxplot(dfs), use_container_width=True)
