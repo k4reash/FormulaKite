@@ -547,11 +547,10 @@
         });
         line(lead, cw + ch, 2, 0.9, []);
         boats.forEach((b) => {
-          const txt =
+          b.tag =
             b === lead
               ? `1º ${b.r.name}`
               : `−${Math.round(Math.abs(lead.up - b.up))} m`;
-          drawTag(txt, b.px + 10, b.py - 12, b.r.color);
         });
       }
 
@@ -661,6 +660,14 @@
         // 3) línea de líder perpendicular al viento (como Sailmon) + barcos + viento
         const twd = windAt();
         if (twd !== null && boats.length >= 2) drawLadder(boats, twd);
+        // etiqueta de cada barco: líder/distancia (si hay línea de líder) · SOG
+        boats.forEach((b) => {
+          const v = metricAt(b.r, SOG_KEY);
+          const txt = [b.tag, v === null ? null : v.toFixed(1)]
+            .filter(Boolean)
+            .join(" · ");
+          if (txt) drawTag(txt, b.px + 10, b.py - 12, b.r.color);
+        });
         boats.forEach((b) => {
           ctx.globalAlpha = b.r.ghost ? 0.6 : 1;
           boatPath(ctx, b.px, b.py, b.p.hdg || 0, b.r.color);
@@ -943,6 +950,7 @@
       }
 
       const CIRCULAR = new Set(["Rumbo (HDT)", "COG", "TWD"]);
+      const SOG_KEY = "Velocidad (SOG)"; // etiqueta de REPLAY_METRICS en app.py
       // valor interpolado entre la muestra i y la i+1 (suaviza el refresco entre datos de 1 Hz)
       function interpAt(vals, r, i, key) {
         const a = vals[i],
