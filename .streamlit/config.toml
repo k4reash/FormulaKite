@@ -2,5 +2,8 @@
 headless = true
 maxUploadSize = 200
 
+[theme]
+base = "dark"  # siempre oscuro, ignore el tema del sistema/navegador (los gráficos ya son oscuros)
+
 [browser]
 gatherUsageStats = false
