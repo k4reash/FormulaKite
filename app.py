@@ -1,11 +1,13 @@
 """
 Formula Kite Analytics Dashboard
-Telemetría Sailmon Max / Vakaros Atlas · Python 3 · Streamlit
+Telemetría Sailmon Max / Vakaros Atlas / Garmin GPX · Python 3 · Streamlit
 """
 
 import io
 import os
+import re
 import struct
+import xml.etree.ElementTree as ET
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -218,7 +220,11 @@ TWD_REF_MIN_FLYING_S = 300   # s en vuelo mínimos para orientar las maniobras
 TWD_BORROW_TOL_S     = 60    # s máximos hasta el dato de Sailmon más cercano al copiar la TWD
 _TWD_HARMONICS = np.arange(1, 9)
 _TWD_AXES = np.radians(np.arange(0, 180, 1.0))
-DEVICE_LABELS = {"sailmon": "Sailmon Max", "atlas": "Vakaros Atlas"}
+GPX_MAX_GAP_S = 8    # GPX: la posición se interpola a 1 Hz solo en huecos de hasta 8 s
+                     # (grabación inteligente); los más largos (reloj bajo el agua) quedan vacíos
+GPX_MAX_KTS   = 45   # GPX: SOG calculada por encima de esto = salto del GPS, se descarta
+GPX_SMOOTH_S  = 3    # GPX: mediana móvil (s) de la SOG calculada a partir de la posición
+DEVICE_LABELS = {"sailmon": "Sailmon Max", "atlas": "Vakaros Atlas", "garmin": "Garmin (GPX)"}
 PHASE_COLORS = {
     "Popa":       "#EF553B",
     "Ceñida":     "#00CC96",
@@ -330,10 +336,13 @@ def classify_phases(sog_kts: pd.Series, twa: pd.Series) -> pd.Series:
 
 
 def detect_device(filename: str, data: bytes):
-    """Devuelve "sailmon", "atlas" o None según la extensión y la cabecera del archivo."""
+    """Devuelve "sailmon", "atlas", "garmin" o None según la extensión y la cabecera del archivo."""
     if filename.lower().endswith(".vkx"):
         return "atlas"
-    header = data[:4096].decode("utf-8", errors="ignore").lstrip("﻿").splitlines()
+    text = data[:4096].decode("utf-8", errors="ignore").lstrip("﻿")
+    if filename.lower().endswith(".gpx") or "<gpx" in text:
+        return "garmin"
+    header = text.splitlines()
     if not header:
         return None
     cols = [c.strip().strip('"').lower() for c in header[0].split(",")]
@@ -439,6 +448,51 @@ def _read_vkx(data: bytes) -> pd.DataFrame:
     })
 
 
+def _read_gpx(data: bytes) -> pd.DataFrame:
+    """Lee un GPX (Garmin, a 1 s o con grabación inteligente) al esquema interno a 1 Hz.
+    El GPX solo trae posición: se quitan los fijos repetidos (misma posición que el anterior y
+    salto doble después → picos de 0 / 50 kts), la posición se interpola a 1 Hz en huecos de
+    hasta GPX_MAX_GAP_S y SOG/COG salen de la diferencia centrada (t−1 → t+1)."""
+    root = ET.fromstring(data)
+    ns = root.tag[:-len("gpx")]  # "{http://www.topografix.com/GPX/1/1}"
+    pts = [(p.findtext(f"{ns}time"), p.get("lat"), p.get("lon")) for p in root.iter(f"{ns}trkpt")]
+    if not pts:
+        raise ValueError("el GPX no contiene puntos de track (trkpt)")
+    raw = pd.DataFrame(pts, columns=["time", "latitude", "longitude"])
+    raw["time"] = pd.to_datetime(raw["time"], errors="coerce", utc=True).dt.tz_localize(None)
+    raw[["latitude", "longitude"]] = raw[["latitude", "longitude"]].apply(pd.to_numeric, errors="coerce")
+    raw = raw.dropna().sort_values("time").drop_duplicates("time")
+    raw = raw[(raw["latitude"].diff() != 0) | (raw["longitude"].diff() != 0)]
+    if len(raw) < 3:
+        raise ValueError("el GPX no tiene suficientes puntos de posición")
+
+    # Posición en metros (equirectangular) interpolada a una rejilla de 1 s
+    R = 6371000.0
+    coslat = np.cos(np.radians(raw["latitude"].mean()))
+    t0 = raw["time"].iloc[0].floor("1s")
+    t_src = (raw["time"] - t0).dt.total_seconds().to_numpy()
+    x_src = np.radians(raw["longitude"].to_numpy()) * R * coslat
+    y_src = np.radians(raw["latitude"].to_numpy()) * R
+    t = np.arange(np.ceil(t_src[0]), np.floor(t_src[-1]) + 1)
+    x, y = np.interp(t, t_src, x_src), np.interp(t, t_src, y_src)
+    nxt = np.searchsorted(t_src, t).clip(1, len(t_src) - 1)
+    in_gap = (t_src[nxt] - t_src[nxt - 1] > GPX_MAX_GAP_S) & ~np.isin(t, t_src)
+    x[in_gap] = y[in_gap] = np.nan
+
+    vx, vy = np.full_like(x, np.nan), np.full_like(y, np.nan)
+    vx[1:-1], vy[1:-1] = (x[2:] - x[:-2]) / 2, (y[2:] - y[:-2]) / 2
+    sog = np.hypot(vx, vy)
+    sog[sog * MS_TO_KNOTS > GPX_MAX_KTS] = np.nan
+    out = pd.DataFrame({
+        "time":      t0 + pd.to_timedelta(t, unit="s"),
+        "latitude":  np.degrees(y / R),
+        "longitude": np.degrees(x / (R * coslat)),
+        "SOG":       pd.Series(sog).rolling(GPX_SMOOTH_S, center=True, min_periods=1).median(),
+        "COG":       np.degrees(np.arctan2(vx, vy)) % 360,
+    })
+    return out.dropna(subset=["latitude", "longitude", "SOG"]).reset_index(drop=True)
+
+
 def _to_1hz(df: pd.DataFrame) -> pd.DataFrame:
     """Remuestrea a 1 Hz (todas las ventanas de la app cuentan muestras como segundos).
     Media aritmética para posición/velocidad y media circular para los ángulos."""
@@ -466,6 +520,10 @@ def load_track(data: bytes, filename: str, device: str) -> pd.DataFrame:
         df = _to_1hz(_read_atlas_raw(data, filename))
     elif filename.lower().endswith(".vkx"):
         raise ValueError("un .vkx solo puede ser del Vakaros Atlas")
+    elif device == "garmin":
+        df = _read_gpx(data)
+    elif filename.lower().endswith(".gpx"):
+        raise ValueError("un .gpx solo puede ser de Garmin (GPX)")
     else:
         df = _read_sailmon(data)
     df["Dispositivo"] = DEVICE_LABELS[device]
@@ -1734,8 +1792,8 @@ with st.sidebar:
     st.divider()
 
     uploaded_files = st.file_uploader(
-        "Archivos (Sailmon Max CSV · Vakaros Atlas CSV/VKX)",
-        type=["csv", "vkx"],
+        "Archivos (Sailmon Max CSV · Vakaros Atlas CSV/VKX · Garmin GPX)",
+        type=["csv", "vkx", "gpx"],
         accept_multiple_files=True,
         help="Un archivo por regatista. El dispositivo se detecta automáticamente.",
         key=f"uploader_{st.session_state.get('_uploader_nonce', 0)}",
@@ -1786,7 +1844,7 @@ if not uploaded_files:
     st.markdown(
         """
         Analiza y compara la telemetría de regatistas de **Formula Kite** con datos de
-        **Sailmon Max** y **Vakaros Atlas**.
+        **Sailmon Max**, **Vakaros Atlas** y relojes **Garmin** (GPX).
 
         **← Carga uno o más archivos** desde el panel lateral para comenzar. El dispositivo
         se detecta automáticamente (también se puede elegir a mano).
@@ -1799,11 +1857,15 @@ if not uploaded_files:
         |-------------|---------|------------|--------|
         | Sailmon Max | export `.csv` (`time`, `SOG`, `COG`, `TWA`, `TWD`, `VMG`…) | 1 Hz | incluido |
         | Vakaros Atlas | export `.csv` (`timestamp`, `sog_kts`, `cog`, `hdg_true`, `heel`, `trim`) o binario `.vkx` | 2 Hz → se remuestrea a 1 Hz | calculado |
+        | Garmin (reloj) | `.gpx` exportado de Garmin Connect (solo posición) | 1 s o grabación inteligente → se interpola a 1 Hz | calculado |
 
-        > El Atlas no registra viento. Su **TWD** se copia de un Sailmon de la misma sesión,
+        > El Atlas y el GPX no registran viento. Su **TWD** se copia de un Sailmon de la misma sesión,
         > se calcula **por maniobras como Sailmon** (bisectriz del rumbo antes y después de cada
         > virada/trasluchada) o se introduce a mano. **TWA** y **VMG** usan las mismas fórmulas
         > que Sailmon: TWA = TWD − COG y VMG = SOG · cos(TWA).
+        >
+        > El GPX solo trae posición: **SOG** y **COG** se calculan a partir de ella (algo menos
+        > precisos que los del Sailmon o el Atlas). Mejor con el reloj grabando cada segundo.
         """
     )
     st.stop()
@@ -2080,10 +2142,36 @@ def _vkx_as_atlas_csv(data: bytes) -> pd.DataFrame:
     return out[["timestamp", "latitude", "longitude", "sog_kts", "cog", "hdg_true", "heel", "trim"]]
 
 
+_GPX_TRKPT = re.compile(rb"[ \t]*<trkpt\b.*?</trkpt>[ \t]*\r?\n?", re.S)
+_GPX_TIME = re.compile(rb"<time>(.*?)</time>")
+
+
+def _trimmed_gpx(data: bytes, trim_range) -> bytes:
+    """El GPX original, sin tocar nada más, quitando los <trkpt> fuera del tramo (se recorta el
+    texto: ElementTree no puede reescribir los prefijos ns2/ns3 de Garmin)."""
+    if not trim_range:
+        return data
+    pts = list(_GPX_TRKPT.finditer(data))
+    times = [m.group(1).decode() if (m := _GPX_TIME.search(p.group())) else None for p in pts]
+    local = pd.to_datetime(pd.Series(times, dtype=object), errors="coerce", utc=True).dt.tz_localize(None)
+    keep = (local + LOCAL_UTC_OFFSET).between(*trim_range).to_numpy()
+    out, last = [], 0
+    for p, k in zip(pts, keep):
+        out.append(data[last:p.start()])
+        if k:
+            out.append(p.group())
+        last = p.end()
+    out.append(data[last:])
+    return b"".join(out)
+
+
 def _raw_trimmed_csv(file, trim_range) -> bytes:
     """Filas del archivo original (mismas columnas, hora en UTC) dentro del tramo, para que
-    el recorte se pueda volver a subir como un export normal. Un .vkx sale como CSV del Atlas."""
+    el recorte se pueda volver a subir como un export normal. Un .vkx sale como CSV del Atlas
+    y un .gpx como GPX."""
     data = file.getvalue()
+    if file.name.lower().endswith(".gpx"):
+        return _trimmed_gpx(data, trim_range)
     if file.name.lower().endswith(".vkx"):
         raw = _vkx_as_atlas_csv(data)
     else:
@@ -2112,18 +2200,20 @@ with _bar_full:
         st.button("Usar sesión completa", on_click=_use_full_session,
                   use_container_width=True, key="bar_full_session")
 
-with st.expander("⬇️ Descargar CSV recortado por regatista"):
+with st.expander("⬇️ Descargar archivo recortado por regatista"):
     st.caption(
         "Mismo formato que el export original (los .vkx se descargan como CSV del Atlas): "
         "puedes volver a subirlo a la app tal cual."
     )
     for _dl_i, (f_dl, df_dl) in enumerate(zip(files_full, dfs_full)):
         _dl_name = df_dl["Regatista"].iloc[0]
+        _dl_ext, _dl_mime = (("gpx", "application/gpx+xml") if f_dl.name.lower().endswith(".gpx")
+                             else ("csv", "text/csv"))
         st.download_button(
-            f"Descargar {_dl_name}_recortado.csv",
+            f"Descargar {_dl_name}_recortado.{_dl_ext}",
             data=_raw_trimmed_csv(f_dl, _trim_range),
-            file_name=f"{_dl_name}_recortado.csv",
-            mime="text/csv",
+            file_name=f"{_dl_name}_recortado.{_dl_ext}",
+            mime=_dl_mime,
             key=f"dl_{_dl_i}",
         )
 
